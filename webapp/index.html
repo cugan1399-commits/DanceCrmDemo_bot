@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Запись — демо Bitrix24</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 16px; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #111); }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .day { margin-bottom: 16px; }
+  .day-label { font-weight: 600; margin-bottom: 6px; text-transform: capitalize; }
+  .slots { display: flex; flex-wrap: wrap; gap: 8px; }
+  .slot { padding: 8px 12px; border-radius: 10px; border: 1px solid var(--tg-theme-hint-color, #ccc); cursor: pointer; font-size: 14px; }
+  .slot.selected { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); }
+  .empty { opacity: .5; font-size: 13px; }
+  form { display: none; margin-top: 20px; flex-direction: column; gap: 10px; }
+  form.visible { display: flex; }
+  select, input, button { padding: 10px; border-radius: 10px; border: 1px solid var(--tg-theme-hint-color, #ccc); font-size: 14px; }
+  button { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); border: none; font-weight: 600; }
+  #status { margin-top: 12px; font-size: 14px; }
+</style>
+</head>
+<body>
+  <h1>Свободное время (из Битрикс24)</h1>
+  <div id="days">Загрузка…</div>
+
+  <form id="bookingForm">
+    <div id="chosenSlot" style="font-size:14px;opacity:.7;"></div>
+    <select id="direction" required></select>
+    <input id="name" placeholder="Имя" required>
+    <input id="phone" placeholder="Телефон" required>
+    <button type="submit">Записаться</button>
+  </form>
+
+  <div id="status"></div>
+
+<script>
+  const tg = window.Telegram?.WebApp;
+  tg?.ready();
+  tg?.expand();
+  const initData = tg?.initData || '';
+
+  let chosen = null;
+
+  async function loadSlots() {
+    const res = await fetch('/api/slots?initData=' + encodeURIComponent(initData));
+    if (!res.ok) { document.getElementById('days').textContent = 'Не удалось загрузить расписание из Битрикса.'; return; }
+    const data = await res.json();
+
+    const dirSelect = document.getElementById('direction');
+    dirSelect.innerHTML = data.directions.map(d => `<option value="${d}">${d}</option>`).join('');
+
+    const container = document.getElementById('days');
+    container.innerHTML = '';
+    for (const day of data.days) {
+      const div = document.createElement('div');
+      div.className = 'day';
+      const slotsHtml = day.slots.length
+        ? day.slots.map(s => `<div class="slot" data-date="${day.dateStr}" data-time="${s}">${s}</div>`).join('')
+        : '<div class="empty">нет свободных окон</div>';
+      div.innerHTML = `<div class="day-label">${day.weekday}, ${day.dateStr}</div><div class="slots">${slotsHtml}</div>`;
+      container.appendChild(div);
+    }
+
+    container.querySelectorAll('.slot').forEach(el => {
+      el.addEventListener('click', () => {
+        container.querySelectorAll('.slot.selected').forEach(s => s.classList.remove('selected'));
+        el.classList.add('selected');
+        chosen = { dateStr: el.dataset.date, time: el.dataset.time };
+        document.getElementById('chosenSlot').textContent = `Выбрано: ${chosen.dateStr} в ${chosen.time}`;
+        document.getElementById('bookingForm').classList.add('visible');
+      });
+    });
+  }
+
+  document.getElementById('bookingForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!chosen) return;
+    const status = document.getElementById('status');
+    status.textContent = 'Отправляем заявку…';
+
+    const res = await fetch('/api/book', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        initData,
+        dateStr: chosen.dateStr,
+        time: chosen.time,
+        direction: document.getElementById('direction').value,
+        name: document.getElementById('name').value,
+        phone: document.getElementById('phone').value,
+      }),
+    });
+
+    if (res.status === 409) { status.textContent = 'Увы, этот слот уже заняли — выберите другой.'; return; }
+    if (!res.ok) { status.textContent = 'Ошибка. Попробуйте позже.'; return; }
+
+    status.textContent = '✅ Заявка отправлена! Ждите подтверждения в этом чате.';
+    document.getElementById('bookingForm').classList.remove('visible');
+    loadSlots();
+  });
+
+  loadSlots();
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "bitrix-booking-demo",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "migrate": "node migration.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "mongodb": "^6.3.0",
+    "node-cron": "^3.0.3"
+  }
+}
