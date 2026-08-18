@@ -101,6 +101,12 @@ function verifyInitData(initData) {
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 
+function hhmmInStudioTZ(date) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(date);
+}
+
 function nowInStudioTZ() {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit',
@@ -294,16 +300,22 @@ cron.schedule('* * * * *', async () => {
       const bookingDateStr = dt.toLocaleDateString('en-CA', { timeZone: STUDIO_TIMEZONE }); // YYYY-MM-DD
       if (bookingDateStr !== dateStr) continue;
 
-      // Напоминание №1: строго в 08:00 в день занятия
-      if (!booking.sentMorning && time === '08:00') {
+      const classTimeStr = hhmmInStudioTZ(dt);
+      const hourBeforeStr = hhmmInStudioTZ(subtractOneHour(dt));
+
+      // Сравниваем строки "HH:MM" лексикографически — это работает, потому что
+      // они всегда с ведущим нулём. Используем ">=", а не "===": если сервер на
+      // бесплатном тарифе Render "проснулся" через несколько минут после нужного
+      // времени (spin-down), напоминание всё равно уйдёт, а не потеряется молча.
+
+      // Напоминание №1: с 08:00 и позже в день занятия (если ещё не отправляли)
+      if (!booking.sentMorning && time >= '08:00') {
         await sendReminder(booking, 'morning');
         await db.collection('confirmedBookings').updateOne({ dealId: booking.dealId }, { $set: { sentMorning: true } });
       }
 
-      // Напоминание №2: строго за 1 час до начала
-      const hourBefore = subtractOneHour(dt);
-      const hourBeforeStr = hourBefore.toLocaleTimeString('ru-RU', { timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit' }).replace('.', ':');
-      if (!booking.sentHour && hourBeforeStr === time) {
+      // Напоминание №2: от "за час до начала" и до самого начала занятия
+      if (!booking.sentHour && time >= hourBeforeStr && time < classTimeStr) {
         await sendReminder(booking, 'hour');
         await db.collection('confirmedBookings').updateOne({ dealId: booking.dealId }, { $set: { sentHour: true } });
       }
