@@ -219,11 +219,12 @@ app.post('/api/book', async (req, res) => {
 // token сверяется с BITRIX_INCOMING_TOKEN, если он задан.
 
 app.post(BITRIX_WEBHOOK_PATH, async (req, res) => {
-  if (BITRIX_INCOMING_TOKEN && req.body.token !== BITRIX_INCOMING_TOKEN) {
+  const token = req.query.token ?? req.body.token;
+  if (BITRIX_INCOMING_TOKEN && token !== BITRIX_INCOMING_TOKEN) {
     return res.status(403).json({ error: 'forbidden' });
   }
 
-  const dealId = req.body.dealId || req.body.id;
+  const dealId = req.query.id || req.body.dealId || req.body.id;
   if (!dealId) return res.status(400).json({ error: 'no_deal_id' });
 
   try {
