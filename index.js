@@ -103,6 +103,31 @@ function verifyInitData(initData) {
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 
+// Смещение (в мс) заданной таймзоны относительно UTC в момент времени `date`
+function tzOffsetMs(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const map = {};
+  dtf.formatToParts(date).forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
+  const asUTC = Date.UTC(map.year, map.month - 1, map.day, map.hour === '24' ? 0 : map.hour, map.minute, map.second);
+  return asUTC - date.getTime();
+}
+
+// Превращает "настенное" время (дата + часы:минуты ПО ВРЕМЕНИ СТУДИИ) в правильный
+// момент в UTC. Раньше код просто делал new Date(...).setHours(h, m), а это молча
+// трактовало часы как время СЕРВЕРА (обычно UTC на Render), а не время студии —
+// из-за этого реальное время в Битриксе уезжало на несколько часов от выбранного.
+function zonedTimeToUTC(dateStr, timeStr, timeZone) {
+  const [y, mo, d] = dateStr.split('-').map(Number);
+  const [h, mi] = timeStr.split(':').map(Number);
+  const guess = new Date(Date.UTC(y, mo - 1, d, h, mi, 0));
+  const offset = tzOffsetMs(guess, timeZone);
+  return new Date(guess.getTime() - offset);
+}
+
 function hhmmInStudioTZ(date) {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
@@ -119,16 +144,22 @@ function nowInStudioTZ() {
   return { time: `${map.hour}:${map.minute}`, dateStr: `${map.year}-${map.month}-${map.day}` };
 }
 
-// Локальная полночь понедельника текущей недели в таймзоне студии, как обычный Date
+// Понедельник текущей недели ПО КАЛЕНДАРЮ СТУДИИ. Возвращает не моменты времени,
+// а просто "якоря" календарных дат (полночь UTC того же Y-M-D) — используются только
+// для перебора дней недели, реальное время вычисляется отдельно через zonedTimeToUTC.
 function currentWeekRange() {
-  const today = new Date();
-  const dow = today.getDay() === 0 ? 7 : today.getDay(); // пн=1..вс=7
-  const monday = new Date(today);
-  monday.setDate(today.getDate() - (dow - 1));
-  monday.setHours(0, 0, 0, 0);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: STUDIO_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const map = {};
+  parts.forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
+
+  const anchor = new Date(Date.UTC(Number(map.year), Number(map.month) - 1, Number(map.day)));
+  const dow = anchor.getUTCDay() === 0 ? 7 : anchor.getUTCDay(); // пн=1..вс=7
+  const monday = new Date(anchor);
+  monday.setUTCDate(anchor.getUTCDate() - (dow - 1));
   const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  sunday.setHours(23, 59, 59, 999);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
   return { monday, sunday };
 }
 
@@ -147,16 +178,14 @@ app.get('/api/slots', async (req, res) => {
 
     const days = [];
     for (let i = 0; i < 7; i++) {
-      const date = new Date(monday);
-      date.setDate(monday.getDate() + i);
-      const dateStr = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+      const anchorDate = new Date(monday);
+      anchorDate.setUTCDate(monday.getUTCDate() + i);
+      const dateStr = `${anchorDate.getUTCFullYear()}-${pad2(anchorDate.getUTCMonth() + 1)}-${pad2(anchorDate.getUTCDate())}`;
 
       const slots = [];
       for (let h = WORK_START_HOUR; h < WORK_END_HOUR; h++) {
-        const slotFrom = new Date(date);
-        slotFrom.setHours(h, 0, 0, 0);
-        const slotTo = new Date(slotFrom);
-        slotTo.setMinutes(slotTo.getMinutes() + SLOT_MINUTES);
+        const slotFrom = zonedTimeToUTC(dateStr, `${pad2(h)}:00`, STUDIO_TIMEZONE);
+        const slotTo = new Date(slotFrom.getTime() + SLOT_MINUTES * 60 * 1000);
 
         // прошедшие слоты не показываем
         if (slotFrom < new Date()) continue;
@@ -165,7 +194,8 @@ app.get('/api/slots', async (req, res) => {
         if (!isBusy) slots.push(`${pad2(h)}:00`);
       }
 
-      days.push({ dateStr, weekday: date.toLocaleDateString('ru-RU', { weekday: 'short' }), slots });
+      const weekday = new Intl.DateTimeFormat('ru-RU', { timeZone: 'UTC', weekday: 'short' }).format(anchorDate);
+      days.push({ dateStr, weekday, slots });
     }
 
     res.json({ days, directions: DIRECTIONS });
@@ -188,11 +218,8 @@ app.post('/api/book', async (req, res) => {
   try {
     // повторно проверяем занятость прямо перед записью — от гонки полностью не спасает,
     // но покрывает подавляющее большинство случаев для демо
-    const [h, m] = time.split(':').map(Number);
-    const fromDate = new Date(`${dateStr}T00:00:00`);
-    fromDate.setHours(h, m, 0, 0);
-    const toDate = new Date(fromDate);
-    toDate.setMinutes(toDate.getMinutes() + SLOT_MINUTES);
+    const fromDate = zonedTimeToUTC(dateStr, time, STUDIO_TIMEZONE);
+    const toDate = new Date(fromDate.getTime() + SLOT_MINUTES * 60 * 1000);
 
     const busy = await getBusyRanges(fromDate, toDate);
     if (busy.some(b => overlaps(fromDate, toDate, b.from, b.to))) {
@@ -346,7 +373,7 @@ async function handleReminderCallback(cq) {
     } catch (err) {
       console.error('Не удалось перевести сделку на стадию подтверждения визита:', err.message);
     }
-    await sendMessage(chatId, '✅ Ждём вас, до встречи! Отметили в CRM — менеджер увидит подтверждение визита.');
+    await sendMessage(chatId, '✅ Ждём вас, до встречи!');
     return;
   }
 
@@ -361,14 +388,12 @@ async function handleReminderCallback(cq) {
     await db.collection('confirmedBookings').updateOne({ dealId }, { $set: { status: 'declined' } });
   }
 
+  // Важно: тип кнопки именно web_app, а не url — обычная url-кнопка открывает страницу
+  // в браузере БЕЗ initData от Telegram, и /api/slots не сможет авторизовать пользователя
   const keyboard = WEBAPP_URL
-    ? { inline_keyboard: [[{ text: '📅 Выбрать другое время', url: WEBAPP_URL }]] }
+    ? { inline_keyboard: [[{ text: '📅 Выбрать другое время', web_app: { url: WEBAPP_URL } }]] }
     : undefined;
-  await sendMessage(
-    chatId,
-    'Хорошо, отметили в CRM, что нужен перенос — менеджер это увидит. Выберите новое время в приложении:',
-    keyboard
-  );
+  await sendMessage(chatId, 'Жаль! Выберите, пожалуйста, новое время в приложении:', keyboard);
 }
 
 app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {

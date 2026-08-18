@@ -40,7 +40,7 @@ export async function bitrixCall(method, params = {}) {
 export async function getBusyRanges(fromDate, toDate) {
   const fmt = (d) => {
     const p = (n) => String(n).padStart(2, '0');
-    return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}`;
+    return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}`;
   };
 
   const events = await bitrixCall('calendar.event.get', {
