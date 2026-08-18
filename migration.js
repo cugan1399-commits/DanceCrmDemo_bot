@@ -13,6 +13,12 @@ import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
 import { createBookingDeal } from './bitrix.js';
 
+// ⚠️ Этот скрипт написан под старую схему студии танцев (classes/directions).
+// После перехода на общую концепцию "встречи" он нужен только для одноразового
+// переноса старых записей и, скорее всего, вам не понадобится для новых данных —
+// но раз он ходит в bitrix.js, привёл его в соответствие с новой сигнатурой
+// (topic + Date-объекты вместо direction + ISO-строк).
+
 const DRY_RUN = true; // <-- переключить на false только после проверки вывода
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -96,9 +102,9 @@ async function migrateFromClassBookings(db) {
       sourceId: cb._id,
       name: profile.name,
       phone: profile.phone,
-      direction: resolveDirectionName(cls.direction, directionsById),
-      fromISO: fromDate.toISOString(),
-      toISO: toDate.toISOString(),
+      topic: resolveDirectionName(cls.direction, directionsById),
+      fromDate,
+      toDate,
       chatId: cb.chatId,
       username: profile.username,
     });
@@ -138,9 +144,9 @@ async function migrateFromApplications(db) {
       sourceId: app._id,
       name: app.name,
       phone: app.phone,
-      direction: app.direction || 'Не указано',
-      fromISO: fromDate.toISOString(),
-      toISO: toDate.toISOString(),
+      topic: app.direction || 'Не указано',
+      fromDate,
+      toDate,
       chatId: app.chatId,
       username: app.username,
     });

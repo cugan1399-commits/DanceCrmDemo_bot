@@ -1,6 +1,7 @@
-// index.js — демо-бот "запись на занятие" с Битрикс24 в роли источника истины
-// для расписания и CRM. Локальная MongoDB используется ТОЛЬКО для того, чтобы
-// напоминания переживали перезапуск сервера (сам список занятий/записей в Mongo не хранится).
+// index.js — демо-бот "приглашение на встречу" с Битрикс24 в роли источника истины
+// для расписания и CRM. Локальная MongoDB используется для того, чтобы напоминания
+// переживали перезапуск сервера, и чтобы у одного chatId была ровно одна "живая"
+// сделка (без дублей при переносе времени).
 //
 // Обязательные переменные окружения — см. .env.example
 
@@ -15,11 +16,22 @@ import cron from 'node-cron';
 import {
   getBusyRanges,
   blockCalendarSlot,
+  removeCalendarEvent,
   createBookingDeal,
+  updateBookingDeal,
   getDeal,
   updateDealStage,
   BITRIX_TG_FIELD_NAME,
+  ORG_TIMEZONE,
 } from './bitrix.js';
+import {
+  zonedTimeToUTC,
+  hhmmInTZ,
+  nowInTZ,
+  currentWeekRange,
+  overlaps,
+  pad2,
+} from './bitrixTime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,31 +45,31 @@ const TELEGRAM_WEBHOOK_PATH = `/webhook/telegram/${BOT_TOKEN}`;
 const BITRIX_WEBHOOK_PATH = '/webhook/bitrix';
 const BITRIX_INCOMING_TOKEN = process.env.BITRIX_INCOMING_TOKEN || null; // задайте, если хотите проверять источник
 
-const STUDIO_TIMEZONE = process.env.STUDIO_TIMEZONE || 'Europe/Minsk';
 const WORK_START_HOUR = Number(process.env.WORK_START_HOUR || 9);
 const WORK_END_HOUR = Number(process.env.WORK_END_HOUR || 20); // последний слот начинается в WORK_END_HOUR - 1
 const SLOT_MINUTES = 60;
 
-// Стадии сделки в Битриксе — ОБЯЗАТЕЛЬНО подставьте реальные ID стадий вашей воронки
+// Стадии сделки в Битриксе — ОБЯЗАТЕЛЬНО подставьте реальные ID стадий вашей воронки.
+const STAGE_NEW = process.env.BITRIX_NEW_STAGE_ID || 'NEW';
 const STAGE_CONFIRMED = process.env.BITRIX_CONFIRMED_STAGE_ID || 'PREPARATION';
 const STAGE_CANCELLED = process.env.BITRIX_CANCELLED_STAGE_ID || 'LOSE';
 const STAGE_VISIT_CONFIRMED = process.env.BITRIX_VISIT_CONFIRMED_STAGE_ID || STAGE_CONFIRMED;
 const WEBAPP_URL = process.env.WEBAPP_URL;
-
-const DIRECTIONS = (process.env.DIRECTIONS || 'Pole Dance,Stretching,Exotic').split(',').map(s => s.trim());
 
 let db;
 const mongoClient = process.env.MONGODB_URI ? new MongoClient(process.env.MONGODB_URI) : null;
 
 async function connectDB() {
   if (!mongoClient) {
-    console.warn('⚠️  MONGODB_URI не задан — напоминания не переживут перезапуск сервера');
+    console.warn('⚠️  MONGODB_URI не задан — напоминания не переживут перезапуск сервера, и не будет защиты от дублей сделок');
     return;
   }
   await mongoClient.connect();
   db = mongoClient.db('bitrix_demo');
   await db.collection('confirmedBookings').createIndex({ dealId: 1 }, { unique: true });
-  console.log('✅ MongoDB подключена (только для состояния напоминаний)');
+  // Ровно одна "живая" сделка на chatId — на ней и держится защита от дублей при переносе времени.
+  await db.collection('activeBookingByChat').createIndex({ chatId: 1 }, { unique: true });
+  console.log('✅ MongoDB подключена');
 }
 connectDB().catch(err => console.error('❌ Ошибка MongoDB:', err));
 
@@ -99,72 +111,10 @@ function verifyInitData(initData) {
   }
 }
 
-// ===================== Время/слоты =====================
-
-function pad2(n) { return String(n).padStart(2, '0'); }
-
-// Смещение (в мс) заданной таймзоны относительно UTC в момент времени `date`
-function tzOffsetMs(date, timeZone) {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    timeZone, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  const map = {};
-  dtf.formatToParts(date).forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
-  const asUTC = Date.UTC(map.year, map.month - 1, map.day, map.hour === '24' ? 0 : map.hour, map.minute, map.second);
-  return asUTC - date.getTime();
-}
-
-// Превращает "настенное" время (дата + часы:минуты ПО ВРЕМЕНИ СТУДИИ) в правильный
-// момент в UTC. Раньше код просто делал new Date(...).setHours(h, m), а это молча
-// трактовало часы как время СЕРВЕРА (обычно UTC на Render), а не время студии —
-// из-за этого реальное время в Битриксе уезжало на несколько часов от выбранного.
-function zonedTimeToUTC(dateStr, timeStr, timeZone) {
-  const [y, mo, d] = dateStr.split('-').map(Number);
-  const [h, mi] = timeStr.split(':').map(Number);
-  const guess = new Date(Date.UTC(y, mo - 1, d, h, mi, 0));
-  const offset = tzOffsetMs(guess, timeZone);
-  return new Date(guess.getTime() - offset);
-}
-
-function hhmmInStudioTZ(date) {
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+function humanTime(date) {
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: ORG_TIMEZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
   }).format(date);
-}
-
-function nowInStudioTZ() {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit',
-    year: 'numeric', month: '2-digit', day: '2-digit', hour12: false,
-  }).formatToParts(new Date());
-  const map = {};
-  parts.forEach(p => { map[p.type] = p.value; });
-  return { time: `${map.hour}:${map.minute}`, dateStr: `${map.year}-${map.month}-${map.day}` };
-}
-
-// Понедельник текущей недели ПО КАЛЕНДАРЮ СТУДИИ. Возвращает не моменты времени,
-// а просто "якоря" календарных дат (полночь UTC того же Y-M-D) — используются только
-// для перебора дней недели, реальное время вычисляется отдельно через zonedTimeToUTC.
-function currentWeekRange() {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: STUDIO_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
-  }).formatToParts(new Date());
-  const map = {};
-  parts.forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
-
-  const anchor = new Date(Date.UTC(Number(map.year), Number(map.month) - 1, Number(map.day)));
-  const dow = anchor.getUTCDay() === 0 ? 7 : anchor.getUTCDay(); // пн=1..вс=7
-  const monday = new Date(anchor);
-  monday.setUTCDate(anchor.getUTCDate() - (dow - 1));
-  const sunday = new Date(monday);
-  sunday.setUTCDate(monday.getUTCDate() + 6);
-  return { monday, sunday };
-}
-
-function overlaps(aFrom, aTo, bFrom, bTo) {
-  return aFrom < bTo && bFrom < aTo;
 }
 
 // GET /api/slots — свободные часовые слоты на текущую неделю
@@ -173,7 +123,7 @@ app.get('/api/slots', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'unauthorized' });
 
   try {
-    const { monday, sunday } = currentWeekRange();
+    const { monday, sunday } = currentWeekRange(ORG_TIMEZONE);
     const busy = await getBusyRanges(monday, sunday);
 
     const days = [];
@@ -184,7 +134,7 @@ app.get('/api/slots', async (req, res) => {
 
       const slots = [];
       for (let h = WORK_START_HOUR; h < WORK_END_HOUR; h++) {
-        const slotFrom = zonedTimeToUTC(dateStr, `${pad2(h)}:00`, STUDIO_TIMEZONE);
+        const slotFrom = zonedTimeToUTC(dateStr, `${pad2(h)}:00`, ORG_TIMEZONE);
         const slotTo = new Date(slotFrom.getTime() + SLOT_MINUTES * 60 * 1000);
 
         // прошедшие слоты не показываем
@@ -198,27 +148,30 @@ app.get('/api/slots', async (req, res) => {
       days.push({ dateStr, weekday, slots });
     }
 
-    res.json({ days, directions: DIRECTIONS });
+    res.json({ days });
   } catch (err) {
     console.error('Ошибка получения слотов из Битрикса:', err.message);
     res.status(502).json({ error: 'bitrix_unavailable' });
   }
 });
 
-// POST /api/book — создать заявку: сделка в Битриксе + блокировка слота в календаре
+// POST /api/book — создать (или перенести) заявку на встречу: сделка в Битриксе +
+// блокировка слота в календаре. Если у этого chatId уже есть "живая" сделка
+// (например, после переноса времени), она ОБНОВЛЯЕТСЯ, а не создаётся заново —
+// иначе в CRM плодятся неотличимые друг от друга копии.
 app.post('/api/book', async (req, res) => {
   const user = verifyInitData(req.body.initData);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
 
-  const { dateStr, time, direction, name, phone } = req.body;
-  if (!dateStr || !time || !direction || !name || !phone) {
+  const { dateStr, time, topic, name, phone } = req.body;
+  if (!dateStr || !time || !topic || !name || !phone) {
     return res.status(400).json({ error: 'invalid_input' });
   }
 
   try {
     // повторно проверяем занятость прямо перед записью — от гонки полностью не спасает,
     // но покрывает подавляющее большинство случаев для демо
-    const fromDate = zonedTimeToUTC(dateStr, time, STUDIO_TIMEZONE);
+    const fromDate = zonedTimeToUTC(dateStr, time, ORG_TIMEZONE);
     const toDate = new Date(fromDate.getTime() + SLOT_MINUTES * 60 * 1000);
 
     const busy = await getBusyRanges(fromDate, toDate);
@@ -226,19 +179,44 @@ app.post('/api/book', async (req, res) => {
       return res.status(409).json({ error: 'slot_taken' });
     }
 
-    const dealId = await createBookingDeal({
-      name, phone, direction,
-      fromISO: fromDate.toISOString(),
-      toISO: toDate.toISOString(),
-      chatId: user.id,
-      username: user.username,
+    const dealInput = {
+      name, phone, topic, fromDate, toDate,
+      chatId: user.id, username: user.username,
+    };
+
+    const existing = db
+      ? await db.collection('activeBookingByChat').findOne({ chatId: user.id })
+      : null;
+
+    let dealId;
+    if (existing) {
+      dealId = existing.dealId;
+      await updateBookingDeal(dealId, dealInput, STAGE_NEW);
+      await removeCalendarEvent(existing.calendarEventId);
+      // старая запись о подтверждении/напоминаниях больше не актуальна — обнуляем,
+      // чтобы вебхук подтверждения и напоминания сработали заново для нового времени
+      if (db) {
+        await db.collection('confirmedBookings').updateOne(
+          { dealId: String(dealId) },
+          { $set: { status: 'rescheduled', confirmationSent: false, sentMorning: false, sentHour: false } },
+        );
+      }
+    } else {
+      dealId = await createBookingDeal(dealInput);
+    }
+
+    const calendarEventId = await blockCalendarSlot({
+      fromDate, toDate,
+      title: `${topic} — ${name} (заявка #${dealId})`,
     });
 
-    await blockCalendarSlot({
-      fromISO: fromDate.toISOString(),
-      toISO: toDate.toISOString(),
-      title: `${direction} — ${name} (заявка #${dealId})`,
-    });
+    if (db) {
+      await db.collection('activeBookingByChat').updateOne(
+        { chatId: user.id },
+        { $set: { chatId: user.id, dealId, calendarEventId } },
+        { upsert: true },
+      );
+    }
 
     res.json({ ok: true, dealId });
   } catch (err) {
@@ -267,21 +245,33 @@ app.post(BITRIX_WEBHOOK_PATH, async (req, res) => {
     const chatId = Number(deal[BITRIX_TG_FIELD_NAME]);
     if (!chatId) return res.status(422).json({ error: 'no_telegram_id_on_deal' });
 
-    const beginDate = deal.BEGINDATE; // ISO datetime
+    const beginDate = deal.BEGINDATE; // ISO datetime со смещением зоны организации
+    const dateTimeKey = String(beginDate);
+
+    // Защита от дублей: если Битрикс дёрнет этот вебхук два раза на одном переходе
+    // стадии (обычное дело для автоматизаций/роботов), сообщение клиенту уйдёт только раз.
+    let alreadySent = false;
     if (db) {
+      const existing = await db.collection('confirmedBookings').findOne({ dealId: String(dealId) });
+      alreadySent = Boolean(existing && existing.confirmationSent && existing.dateTime === dateTimeKey);
+
       await db.collection('confirmedBookings').updateOne(
         { dealId: String(dealId) },
-        { $set: {
-          dealId: String(dealId), chatId, title: deal.TITLE,
-          dateTime: beginDate, status: 'confirmed', sentMorning: false, sentHour: false,
-        } },
-        { upsert: true }
+        {
+          $set: { dealId: String(dealId), chatId, title: deal.TITLE, dateTime: dateTimeKey, status: 'confirmed' },
+          $setOnInsert: { sentMorning: false, sentHour: false },
+        },
+        { upsert: true },
       );
+      if (!alreadySent) {
+        await db.collection('confirmedBookings').updateOne({ dealId: String(dealId) }, { $set: { confirmationSent: true } });
+      }
     }
 
-    const dt = new Date(beginDate);
-    const humanTime = dt.toLocaleString('ru-RU', { timeZone: STUDIO_TIMEZONE, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-    await sendMessage(chatId, `✅ Ваша запись успешно подтверждена на ${humanTime}!`);
+    if (!alreadySent) {
+      const dt = new Date(beginDate);
+      await sendMessage(chatId, `✅ Ваша запись на встречу подтверждена на ${humanTime(dt)}!`);
+    }
 
     res.json({ ok: true });
   } catch (err) {
@@ -301,11 +291,11 @@ function subtractOneHour(date) {
 async function sendReminder(booking, kind) {
   // kind: 'morning' | 'hour'
   const dt = new Date(booking.dateTime);
-  const timeStr = dt.toLocaleTimeString('ru-RU', { timeZone: STUDIO_TIMEZONE, hour: '2-digit', minute: '2-digit' });
+  const timeStr = hhmmInTZ(dt, ORG_TIMEZONE);
 
   const text = kind === 'morning'
-    ? `Доброе утро! Напоминаем, что вы записаны сегодня на танцы в ${timeStr}. Вы будете?`
-    : `Ждем вас через час (в ${timeStr})! Всё в силе?`;
+    ? `Доброе утро! Напоминаем, что у вас сегодня встреча в ${timeStr}. Вы будете?`
+    : `Ждём вас через час (в ${timeStr})! Всё в силе?`;
 
   const yesLabel = kind === 'morning' ? '✅ Да, буду' : '✅ Да, еду';
   const noLabel = kind === 'morning' ? '❌ Нет, перенести' : '❌ Нет, не смогу';
@@ -321,29 +311,29 @@ async function sendReminder(booking, kind) {
 cron.schedule('* * * * *', async () => {
   if (!db) return;
   try {
-    const { time, dateStr } = nowInStudioTZ();
+    const { time, dateStr } = nowInTZ(ORG_TIMEZONE);
     const bookings = await db.collection('confirmedBookings').find({ status: 'confirmed' }).toArray();
 
     for (const booking of bookings) {
       const dt = new Date(booking.dateTime);
-      const bookingDateStr = dt.toLocaleDateString('en-CA', { timeZone: STUDIO_TIMEZONE }); // YYYY-MM-DD
+      const bookingDateStr = dt.toLocaleDateString('en-CA', { timeZone: ORG_TIMEZONE }); // YYYY-MM-DD
       if (bookingDateStr !== dateStr) continue;
 
-      const classTimeStr = hhmmInStudioTZ(dt);
-      const hourBeforeStr = hhmmInStudioTZ(subtractOneHour(dt));
+      const classTimeStr = hhmmInTZ(dt, ORG_TIMEZONE);
+      const hourBeforeStr = hhmmInTZ(subtractOneHour(dt), ORG_TIMEZONE);
 
       // Сравниваем строки "HH:MM" лексикографически — это работает, потому что
       // они всегда с ведущим нулём. Используем ">=", а не "===": если сервер на
       // бесплатном тарифе Render "проснулся" через несколько минут после нужного
       // времени (spin-down), напоминание всё равно уйдёт, а не потеряется молча.
 
-      // Напоминание №1: с 08:00 и позже в день занятия (если ещё не отправляли)
+      // Напоминание №1: с 08:00 и позже в день встречи (если ещё не отправляли)
       if (!booking.sentMorning && time >= '08:00') {
         await sendReminder(booking, 'morning');
         await db.collection('confirmedBookings').updateOne({ dealId: booking.dealId }, { $set: { sentMorning: true } });
       }
 
-      // Напоминание №2: от "за час до начала" и до самого начала занятия
+      // Напоминание №2: от "за час до начала" и до самого начала встречи
       if (!booking.sentHour && time >= hourBeforeStr && time < classTimeStr) {
         await sendReminder(booking, 'hour');
         await db.collection('confirmedBookings').updateOne({ dealId: booking.dealId }, { $set: { sentHour: true } });
@@ -378,7 +368,9 @@ async function handleReminderCallback(cq) {
   }
 
   // "Нет" — переводим сделку на стадию "нужен перенос", сразу предлагаем выбрать новое
-  // время и глушим второе напоминание (нет смысла спрашивать второй раз в тот же день)
+  // время и глушим второе напоминание (нет смысла спрашивать второй раз в тот же день).
+  // Сама сделка остаётся той же — новую копию создаст (и вернёт на STAGE_NEW) только
+  // /api/book при повторной записи, см. комментарий там.
   try {
     await updateDealStage(dealId, STAGE_CANCELLED);
   } catch (err) {
@@ -406,7 +398,7 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
     if (update.message?.text === '/start') {
       await sendMessage(
         update.message.chat.id,
-        '👋 Привет! Открой мини-приложение кнопкой снизу, чтобы посмотреть свободное время и записаться.'
+        '👋 Привет! Открой мини-приложение кнопкой снизу, чтобы посмотреть свободное время и записаться на встречу.'
       );
     }
   } catch (err) {
