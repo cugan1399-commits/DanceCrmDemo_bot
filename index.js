@@ -41,6 +41,8 @@ const SLOT_MINUTES = 60;
 // Стадии сделки в Битриксе — ОБЯЗАТЕЛЬНО подставьте реальные ID стадий вашей воронки
 const STAGE_CONFIRMED = process.env.BITRIX_CONFIRMED_STAGE_ID || 'PREPARATION';
 const STAGE_CANCELLED = process.env.BITRIX_CANCELLED_STAGE_ID || 'LOSE';
+const STAGE_VISIT_CONFIRMED = process.env.BITRIX_VISIT_CONFIRMED_STAGE_ID || STAGE_CONFIRMED;
+const WEBAPP_URL = process.env.WEBAPP_URL;
 
 const DIRECTIONS = (process.env.DIRECTIONS || 'Pole Dance,Stretching,Exotic').split(',').map(s => s.trim());
 
@@ -339,20 +341,34 @@ async function handleReminderCallback(cq) {
   await clearInlineKeyboard(chatId, messageId);
 
   if (answer === 'yes') {
-    await sendMessage(chatId, '✅ Ждём вас, до встречи!');
+    try {
+      await updateDealStage(dealId, STAGE_VISIT_CONFIRMED);
+    } catch (err) {
+      console.error('Не удалось перевести сделку на стадию подтверждения визита:', err.message);
+    }
+    await sendMessage(chatId, '✅ Ждём вас, до встречи! Отметили в CRM — менеджер увидит подтверждение визита.');
     return;
   }
 
-  // "Нет" — переводим сделку в стадию отмены/переноса и уведомляем клиента
+  // "Нет" — переводим сделку на стадию "нужен перенос", сразу предлагаем выбрать новое
+  // время и глушим второе напоминание (нет смысла спрашивать второй раз в тот же день)
   try {
     await updateDealStage(dealId, STAGE_CANCELLED);
   } catch (err) {
     console.error('Не удалось обновить стадию сделки:', err.message);
   }
   if (db) {
-    await db.collection('confirmedBookings').updateOne({ dealId }, { $set: { status: 'cancelled' } });
+    await db.collection('confirmedBookings').updateOne({ dealId }, { $set: { status: 'declined' } });
   }
-  await sendMessage(chatId, 'Хорошо, отметили это в CRM. Свяжемся с вами насчёт переноса 🙌');
+
+  const keyboard = WEBAPP_URL
+    ? { inline_keyboard: [[{ text: '📅 Выбрать другое время', url: WEBAPP_URL }]] }
+    : undefined;
+  await sendMessage(
+    chatId,
+    'Хорошо, отметили в CRM, что нужен перенос — менеджер это увидит. Выберите новое время в приложении:',
+    keyboard
+  );
 }
 
 app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
