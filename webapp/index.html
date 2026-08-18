@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Запись — демо Bitrix24</title>
+<title>Встреча — демо Bitrix24</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { color-scheme: light dark; }
@@ -28,10 +28,10 @@
 
   <form id="bookingForm">
     <div id="chosenSlot" style="font-size:14px;opacity:.7;"></div>
-    <select id="direction" required></select>
+    <input id="topic" placeholder="Тема встречи" required>
     <input id="name" placeholder="Имя" required>
     <input id="phone" placeholder="Телефон" required>
-    <button type="submit">Записаться</button>
+    <button type="submit">Записаться на встречу</button>
   </form>
 
   <div id="status"></div>
@@ -48,9 +48,6 @@
     const res = await fetch('/api/slots?initData=' + encodeURIComponent(initData));
     if (!res.ok) { document.getElementById('days').textContent = 'Не удалось загрузить расписание из Битрикса.'; return; }
     const data = await res.json();
-
-    const dirSelect = document.getElementById('direction');
-    dirSelect.innerHTML = data.directions.map(d => `<option value="${d}">${d}</option>`).join('');
 
     const container = document.getElementById('days');
     container.innerHTML = '';
@@ -88,7 +85,7 @@
         initData,
         dateStr: chosen.dateStr,
         time: chosen.time,
-        direction: document.getElementById('direction').value,
+        topic: document.getElementById('topic').value,
         name: document.getElementById('name').value,
         phone: document.getElementById('phone').value,
       }),
