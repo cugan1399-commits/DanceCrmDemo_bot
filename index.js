@@ -21,9 +21,11 @@ import {
   updateBookingDeal,
   getDeal,
   updateDealStage,
+  notifyManagerAboutEscalation,
   BITRIX_TG_FIELD_NAME,
   ORG_TIMEZONE,
 } from './bitrix.js';
+import { handleUserMessage, isStopWordTrigger } from './ai.js';
 import {
   zonedTimeToUTC,
   hhmmInTZ,
@@ -85,9 +87,43 @@ async function connectDB() {
   await db.collection('dealBookingInfo').createIndex({ dealId: 1 }, { unique: true });
   // Ровно одна "живая" сделка на chatId — на ней и держится защита от дублей при переносе времени.
   await db.collection('activeBookingByChat').createIndex({ chatId: 1 }, { unique: true });
+  // Состояние ИИ-консультанта по чату: { chatId, aiActive, updatedAt }.
+  // aiActive=true по умолчанию — на новые чаты отвечает ИИ, пока его не выключит
+  // либо стоп-слово клиента, либо сама модель через escalate_to_human, либо менеджер вручную.
+  await db.collection('aiChatStatus').createIndex({ chatId: 1 }, { unique: true });
+  // История диалога с ИИ по чату (для контекста между сообщениями) — см. ai.js.
+  await db.collection('aiConversations').createIndex({ chatId: 1 }, { unique: true });
   console.log('✅ MongoDB подключена');
 }
 connectDB().catch(err => console.error('❌ Ошибка MongoDB:', err));
+
+// ===================== Состояние ИИ-консультанта по чату =====================
+
+// По умолчанию (для ещё не встречавшихся chatId) ИИ активен — см. п.1 ТЗ.
+async function isAiActive(chatId) {
+  if (!db) return true;
+  const doc = await db.collection('aiChatStatus').findOne({ chatId });
+  return doc ? doc.aiActive !== false : true;
+}
+
+async function setAiActive(chatId, aiActive) {
+  if (!db) return;
+  await db.collection('aiChatStatus').updateOne(
+    { chatId },
+    { $set: { chatId, aiActive, updatedAt: new Date() } },
+    { upsert: true },
+  );
+}
+
+// Общая точка выключения ИИ + уведомления менеджера — вызывается и из стоп-слов,
+// и из ответа модели (escalate_to_human), поэтому вынесена отдельно.
+async function escalateToHuman(chatId, reason) {
+  await setAiActive(chatId, false);
+  await notifyManagerAboutEscalation({ chatId, reason }).catch(err => {
+    console.error('Не удалось уведомить менеджера в Битриксе:', err.message);
+  });
+  await sendMessage(chatId, '👤 Передаю ваш вопрос менеджеру — он подключится к чату в ближайшее время.');
+}
 
 // ===================== Telegram helpers =====================
 
@@ -517,6 +553,30 @@ async function handleReminderCallback(cq) {
   await sendMessage(chatId, 'Жаль! Выберите, пожалуйста, новое время в приложении:', keyboard);
 }
 
+// Обычный текст (не команда, не нажатие инлайн-кнопки) — передаём ИИ-консультанту,
+// если он включён для этого чата. Если выключен (менеджер держит диалог руками) —
+// молча ничего не делаем, чтобы не мешать живой переписке.
+async function handleAiText(chatId, text) {
+  // Быстрый путь: стоп-слова клиента распознаём без обращения к модели.
+  if (isStopWordTrigger(text)) {
+    await escalateToHuman(chatId, 'клиент написал стоп-слово ("оператор"/"менеджер"/"человек")');
+    return;
+  }
+
+  const active = await isAiActive(chatId);
+  if (!active) return; // менеджер уже ведёт чат руками — ИИ молчит
+
+  try {
+    const { replyText, escalate, escalateReason } = await handleUserMessage({ db, chatId, userText: text });
+    if (replyText) await sendMessage(chatId, replyText);
+    if (escalate) await escalateToHuman(chatId, escalateReason);
+  } catch (err) {
+    console.error('Ошибка ИИ-консультанта:', err.message);
+    await sendMessage(chatId, 'Извините, техническая заминка. Уже зову менеджера.').catch(() => {});
+    await escalateToHuman(chatId, 'техническая ошибка при обращении к ИИ');
+  }
+}
+
 app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
   const update = req.body;
   try {
@@ -524,16 +584,41 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
       await handleReminderCallback(update.callback_query);
       return res.sendStatus(200);
     }
-    if (update.message?.text === '/start') {
+    const text = update.message?.text;
+    const chatId = update.message?.chat?.id;
+    if (text === '/start') {
       await sendMessage(
-        update.message.chat.id,
-        '👋 Привет! Открой мини-приложение кнопкой снизу, чтобы посмотреть свободное время и записаться на встречу.'
+        chatId,
+        '👋 Привет! Открой мини-приложение кнопкой снизу, чтобы посмотреть свободное время и записаться на встречу, или просто напиши вопрос — отвечу.'
       );
+    } else if (text && chatId) {
+      await handleAiText(chatId, text);
     }
   } catch (err) {
     console.error('Ошибка Telegram webhook:', err);
   }
   res.sendStatus(200);
+});
+
+// ===================== Ручное включение ИИ менеджером =====================
+//
+// POST /api/manager/resume-ai  { chatId }  header: X-Manager-Token: <MANAGER_API_TOKEN>
+// Временный эндпоинт для кнопки в Битриксе/админке — включает ИИ обратно после того,
+// как менеджер закончил ручную переписку. Токен сравнивается строкой, не для продакшена
+// без HTTPS + более серьёзной авторизации, но для демо/временного использования достаточно.
+const MANAGER_API_TOKEN = process.env.MANAGER_API_TOKEN || null;
+
+app.post('/api/manager/resume-ai', async (req, res) => {
+  const token = req.header('X-Manager-Token') || req.query.token || req.body?.token;
+  if (!MANAGER_API_TOKEN || token !== MANAGER_API_TOKEN) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const chatId = req.body?.chatId ?? req.query.chatId;
+  if (chatId === undefined) return res.status(400).json({ error: 'no_chat_id' });
+
+  await setAiActive(Number(chatId) || chatId, true);
+  await sendMessage(Number(chatId) || chatId, '🤖 Снова на связи — чем могу помочь?').catch(() => {});
+  res.json({ ok: true });
 });
 
 const PORT = process.env.PORT || 3000;

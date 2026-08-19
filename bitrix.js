@@ -145,4 +145,29 @@ export function updateDealStage(dealId, stageId) {
   return bitrixCall('crm.deal.update', { id: dealId, fields: { STAGE_ID: stageId } });
 }
 
+// ---------- Уведомление менеджера (перехват диалога человеком) ----------
+
+// ID сотрудника Битрикс24, на которого ставится срочная задача, когда ИИ передаёт
+// диалог человеку. Найти ID: Компания -> Сотрудники -> открыть карточку -> число в URL.
+const BITRIX_MANAGER_USER_ID = process.env.BITRIX_MANAGER_USER_ID;
+
+// Через задачу (tasks.task.add) — работает с обычным входящим вебхуком без доп. прав
+// на чаты/ботов, поэтому взято как основной способ. Если у вас настроены Открытые
+// линии и вебхук с правами imbot — можно параллельно дернуть imbot.message.add,
+// это не помешает.
+export async function notifyManagerAboutEscalation({ chatId, reason }) {
+  if (!BITRIX_MANAGER_USER_ID) {
+    console.warn('⚠️  BITRIX_MANAGER_USER_ID не задан — задача менеджеру не создана, только лог:', chatId, reason);
+    return null;
+  }
+  return bitrixCall('tasks.task.add', {
+    fields: {
+      TITLE: `⚠️ ИИ отключен в чате с пользователем. Клиент просит человека!`,
+      DESCRIPTION: `Telegram chatId: ${chatId}\nПричина: ${reason || 'не указана'}`,
+      RESPONSIBLE_ID: BITRIX_MANAGER_USER_ID,
+      PRIORITY: 2, // высокий приоритет
+    },
+  });
+}
+
 export { BITRIX_TG_FIELD_NAME, BITRIX_CALENDAR_ID, BITRIX_CALENDAR_TYPE, ORG_TIMEZONE };
