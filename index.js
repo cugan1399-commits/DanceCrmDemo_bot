@@ -73,6 +73,16 @@ async function connectDB() {
   await mongoClient.connect();
   db = mongoClient.db('bitrix_demo');
   await db.collection('confirmedBookings').createIndex({ dealId: 1 }, { unique: true });
+  // ИСТОЧНИК ИСТИНЫ по времени встречи — то, что мы САМИ вычислили при бронировании
+  // (fromDate), а не то, что Битрикс потом отдаёт обратно через crm.deal.get.
+  // Причина: TITLE сделки в Битриксе строится из этого же fromDate и показывает
+  // ВЕРНОЕ время (это подтверждено — в самой сделке время правильное), а вот
+  // deal.BEGINDATE, возвращаемый API при повторном чтении, у некоторых порталов
+  // Битрикс24 приходит в другом часовом поясе/формате и "не тот час" ловится именно
+  // здесь. Поэтому напоминания и подтверждения теперь берут время ИЗ ЭТОЙ таблицы,
+  // а не из ответа Битрикса — так баг с некорректным часом устраняется полностью,
+  // а не только чинится парсинг очередного формата даты.
+  await db.collection('dealBookingInfo').createIndex({ dealId: 1 }, { unique: true });
   // Ровно одна "живая" сделка на chatId — на ней и держится защита от дублей при переносе времени.
   await db.collection('activeBookingByChat').createIndex({ chatId: 1 }, { unique: true });
   console.log('✅ MongoDB подключена');
@@ -270,7 +280,25 @@ app.post('/api/book', async (req, res) => {
         { $set: { chatId: user.id, dealId, calendarEventId } },
         { upsert: true },
       );
+      // Наш собственный источник истины по времени встречи для этой сделки —
+      // см. комментарий у createIndex('dealBookingInfo') в connectDB().
+      await db.collection('dealBookingInfo').updateOne(
+        { dealId: String(dealId) },
+        { $set: { dealId: String(dealId), chatId: user.id, dateTime: fromDate.toISOString(), topic, name } },
+        { upsert: true },
+      );
     }
+
+    // ФИКС "непонятно, отправилась ли заявка": раньше об этом сообщал только текст
+    // в самом мини-приложении — если пользователь его быстро закрыл, в чате бота
+    // не оставалось никакого следа. Теперь дублируем это отдельным сообщением в чат
+    // сразу при создании/переносе заявки — и для первой записи, и для переноса.
+    await sendMessage(
+      user.id,
+      existing
+        ? `📩 Новая заявка на ${humanTime(fromDate)} отправлена! Ждите подтверждения в этом чате.`
+        : `📩 Заявка на ${humanTime(fromDate)} отправлена! Ждите подтверждения в этом чате.`,
+    ).catch(err => console.error('Не удалось отправить сообщение "заявка отправлена":', err.message));
 
     res.json({ ok: true, dealId });
   } catch (err) {
@@ -296,20 +324,31 @@ app.post(BITRIX_WEBHOOK_PATH, async (req, res) => {
 
   try {
     const deal = await getDeal(dealId);
-    const chatId = Number(deal[BITRIX_TG_FIELD_NAME]);
+    const ownRecord = db ? await db.collection('dealBookingInfo').findOne({ dealId: String(dealId) }) : null;
+    const chatId = ownRecord?.chatId || Number(deal[BITRIX_TG_FIELD_NAME]);
     if (!chatId) return res.status(422).json({ error: 'no_telegram_id_on_deal' });
 
-    // ФИКС "напоминание пришло не в то время / показывает не тот час":
-    // deal.BEGINDATE — это то, что crm.deal.get ОТДАЁТ обратно, а не то, что мы сами
-    // туда положили. Bitrix не всегда возвращает его в чистом ISO+смещение — иногда
-    // это классический битриксовский "ДД.ММ.ГГГГ ЧЧ:ММ:СС". `new Date(beginDate)`
-    // в таком случае либо даёт Invalid Date, либо (что хуже и незаметнее) JS
-    // интерпретирует строку по каким-то своим догадкам — и именно так время "уезжает"
-    // на несколько часов. Используем тот же терпимый парсер, что и для календаря.
-    const dt = parseBitrixDateTime(deal.BEGINDATE, ORG_TIMEZONE);
-    if (!dt) {
-      console.error('Не удалось разобрать BEGINDATE сделки:', dealId, deal.BEGINDATE);
-      return res.status(422).json({ error: 'bad_begindate' });
+    // ФИКС "напоминание/подтверждение показывает не тот час": TITLE сделки в Битриксе
+    // строится из нашего же fromDate и показывает ВЕРНОЕ время — то есть проблема не
+    // в том, что мы отправляем, а в том, что deal.BEGINDATE при обратном чтении через
+    // crm.deal.get у некоторых порталов Битрикс24 приходит уже не тем значением/поясом.
+    // Поэтому больше не берём время встречи из ответа Битрикса как источник истины —
+    // берём его из dealBookingInfo, куда сами положили точное значение ещё в /api/book.
+    // deal.BEGINDATE используется только как запасной вариант для очень старых сделок,
+    // созданных ДО этого фикса (когда своей записи ещё не было) — и логируем оба
+    // значения, чтобы при следующем расхождении сразу было видно, что именно Битрикс
+    // возвращает не то, что мы туда клали.
+    let dt;
+    if (ownRecord) {
+      dt = new Date(ownRecord.dateTime);
+      console.log(`📥 [dealId ${dealId}] время встречи взято из своей БД: ${humanTime(dt)} (сырое поле Битрикса BEGINDATE для сравнения: ${deal.BEGINDATE})`);
+    } else {
+      dt = parseBitrixDateTime(deal.BEGINDATE, ORG_TIMEZONE);
+      console.warn(`⚠️  [dealId ${dealId}] своей записи о времени нет (старая сделка?) — приходится доверять Битриксу. BEGINDATE=${deal.BEGINDATE}`);
+      if (!dt) {
+        console.error('Не удалось разобрать BEGINDATE сделки:', dealId, deal.BEGINDATE);
+        return res.status(422).json({ error: 'bad_begindate' });
+      }
     }
     // Храним КАНОНИЧЕСКИЙ UTC ISO (dt.toISOString()), а не сырую строку от Битрикса.
     // Тогда cron ниже, который делает new Date(booking.dateTime), больше не зависит
