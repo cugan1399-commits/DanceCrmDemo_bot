@@ -231,8 +231,22 @@ app.post('/api/book', async (req, res) => {
     let dealId;
     if (existing) {
       dealId = existing.dealId;
-      await updateBookingDeal(dealId, dealInput, STAGE_NEW);
-      await removeCalendarEvent(existing.calendarEventId);
+      try {
+        await updateBookingDeal(dealId, dealInput, STAGE_NEW);
+      } catch (err) {
+        // ФИКС "Bitrix24 crm.deal.update: HTTP 400 — Not found": локально мы помним
+        // dealId как "активную" сделку клиента, но в самом Битриксе её больше нет
+        // (удалили руками при тестах, или она вообще не создалась из-за более ранней
+        // ошибки) — update на несуществующий ID падает и ложится всей записью.
+        // Вместо того чтобы блокировать бронирование протухшей ссылкой — считаем
+        // сделку потерянной и создаём новую, как для нового клиента.
+        const notFound = err.httpStatus === 400 || err.httpStatus === 404
+          || /not found/i.test(err.message || '');
+        if (!notFound) throw err;
+        console.warn(`⚠️  Сделка #${dealId} из activeBookingByChat не найдена в Битриксе — создаю новую взамен`);
+        dealId = await createBookingDeal(dealInput);
+      }
+      await removeCalendarEvent(existing.calendarEventId).catch(() => {});
       // старая запись о подтверждении/напоминаниях больше не актуальна — обнуляем,
       // чтобы вебхук подтверждения и напоминания сработали заново для нового времени
       if (db) {
