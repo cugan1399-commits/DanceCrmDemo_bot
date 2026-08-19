@@ -53,6 +53,13 @@ export function nowInTZ(timeZone) {
   return { time: `${map.hour}:${map.minute}`, dateStr: `${map.year}-${map.month}-${map.day}` };
 }
 
+// "Якорная" дата (полночь UTC того же Y-M-D) из строки "YYYY-MM-DD" — используется
+// исключительно для перебора дней (день+1, день+2, ...), не как реальный момент времени.
+export function dateStrToAnchor(dateStr) {
+  const [y, mo, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y, mo - 1, d));
+}
+
 // Понедельник текущей недели по календарю организации — только "якоря" дат
 // (полночь UTC того же Y-M-D, используется исключительно для перебора дней недели).
 export function currentWeekRange(timeZone) {

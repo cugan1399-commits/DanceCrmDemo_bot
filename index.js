@@ -28,9 +28,10 @@ import {
   zonedTimeToUTC,
   hhmmInTZ,
   nowInTZ,
-  currentWeekRange,
   overlaps,
   pad2,
+  parseBitrixDateTime,
+  dateStrToAnchor,
 } from './bitrixTime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +49,11 @@ const BITRIX_INCOMING_TOKEN = process.env.BITRIX_INCOMING_TOKEN || null; // за
 const WORK_START_HOUR = Number(process.env.WORK_START_HOUR || 9);
 const WORK_END_HOUR = Number(process.env.WORK_END_HOUR || 20); // последний слот начинается в WORK_END_HOUR - 1
 const SLOT_MINUTES = 60;
+// Сколько дней вперёд показываем "лентой" по умолчанию (не привязано к пн-вс,
+// а всегда начинается с сегодня — см. /api/slots).
+const ROLLING_DAYS_AHEAD = Number(process.env.ROLLING_DAYS_AHEAD || 7);
+// Насколько далеко в будущее можно заглянуть через календарь/дата-пикер в приложении.
+const MAX_DAYS_AHEAD = Number(process.env.MAX_DAYS_AHEAD || 60);
 
 // Стадии сделки в Битриксе — ОБЯЗАТЕЛЬНО подставьте реальные ID стадий вашей воронки.
 const STAGE_NEW = process.env.BITRIX_NEW_STAGE_ID || 'NEW';
@@ -117,38 +123,72 @@ function humanTime(date) {
   }).format(date);
 }
 
-// GET /api/slots — свободные часовые слоты на текущую неделю
+function slotsForDay(anchorDate, dateStr, busy) {
+  const slots = [];
+  for (let h = WORK_START_HOUR; h < WORK_END_HOUR; h++) {
+    const slotFrom = zonedTimeToUTC(dateStr, `${pad2(h)}:00`, ORG_TIMEZONE);
+    const slotTo = new Date(slotFrom.getTime() + SLOT_MINUTES * 60 * 1000);
+
+    // прошедшие слоты не показываем
+    if (slotFrom < new Date()) continue;
+
+    const isBusy = busy.some(b => overlaps(slotFrom, slotTo, b.from, b.to));
+    if (!isBusy) slots.push(`${pad2(h)}:00`);
+  }
+  const weekday = new Intl.DateTimeFormat('ru-RU', { timeZone: 'UTC', weekday: 'short' }).format(anchorDate);
+  return { dateStr, weekday, slots };
+}
+
+// GET /api/slots — свободные часовые слоты.
+//
+// ФИКС "дни пропадают/остаются пустыми не той длины": раньше лента всегда строилась
+// от понедельника до воскресенья ТЕКУЩЕЙ недели — если сегодня, скажем, среда, то
+// понедельник и вторник всё равно попадали в список, просто с пустыми слотами
+// ("нет свободных окон"), а в следующий понедельник список резко "перепрыгивал"
+// на новую неделю. Теперь лента всегда начинается с СЕГОДНЯ и просто едет вперёд
+// на ROLLING_DAYS_AHEAD дней — прошедшие дни никогда не показываются вообще.
+//
+// Опционально: ?date=YYYY-MM-DD — вернуть слоты только на одну конкретную дату
+// (используется календарём/дата-пикером в приложении для дат вне ближайшей ленты).
 app.get('/api/slots', async (req, res) => {
   const user = verifyInitData(req.query.initData);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
 
+  const { dateStr: todayStr } = nowInTZ(ORG_TIMEZONE);
+  const todayAnchor = dateStrToAnchor(todayStr);
+
   try {
-    const { monday, sunday } = currentWeekRange(ORG_TIMEZONE);
-    const busy = await getBusyRanges(monday, sunday);
-
-    const days = [];
-    for (let i = 0; i < 7; i++) {
-      const anchorDate = new Date(monday);
-      anchorDate.setUTCDate(monday.getUTCDate() + i);
-      const dateStr = `${anchorDate.getUTCFullYear()}-${pad2(anchorDate.getUTCMonth() + 1)}-${pad2(anchorDate.getUTCDate())}`;
-
-      const slots = [];
-      for (let h = WORK_START_HOUR; h < WORK_END_HOUR; h++) {
-        const slotFrom = zonedTimeToUTC(dateStr, `${pad2(h)}:00`, ORG_TIMEZONE);
-        const slotTo = new Date(slotFrom.getTime() + SLOT_MINUTES * 60 * 1000);
-
-        // прошедшие слоты не показываем
-        if (slotFrom < new Date()) continue;
-
-        const isBusy = busy.some(b => overlaps(slotFrom, slotTo, b.from, b.to));
-        if (!isBusy) slots.push(`${pad2(h)}:00`);
+    if (req.query.date) {
+      const requestedStr = String(req.query.date);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedStr)) {
+        return res.status(400).json({ error: 'invalid_date' });
       }
-
-      const weekday = new Intl.DateTimeFormat('ru-RU', { timeZone: 'UTC', weekday: 'short' }).format(anchorDate);
-      days.push({ dateStr, weekday, slots });
+      const anchor = dateStrToAnchor(requestedStr);
+      const daysDiff = Math.round((anchor.getTime() - todayAnchor.getTime()) / 86400000);
+      if (daysDiff < 0 || daysDiff > MAX_DAYS_AHEAD) {
+        return res.status(400).json({ error: 'date_out_of_range' });
+      }
+      const dayStart = new Date(anchor);
+      const dayEnd = new Date(anchor.getTime() + 24 * 60 * 60 * 1000);
+      const busy = await getBusyRanges(dayStart, dayEnd);
+      return res.json({ days: [slotsForDay(anchor, requestedStr, busy)] });
     }
 
-    res.json({ days });
+    const rangeEnd = new Date(todayAnchor.getTime() + ROLLING_DAYS_AHEAD * 24 * 60 * 60 * 1000);
+    const busy = await getBusyRanges(todayAnchor, rangeEnd);
+
+    const days = [];
+    for (let i = 0; i < ROLLING_DAYS_AHEAD; i++) {
+      const anchorDate = new Date(todayAnchor);
+      anchorDate.setUTCDate(todayAnchor.getUTCDate() + i);
+      const dateStr = `${anchorDate.getUTCFullYear()}-${pad2(anchorDate.getUTCMonth() + 1)}-${pad2(anchorDate.getUTCDate())}`;
+      days.push(slotsForDay(anchorDate, dateStr, busy));
+    }
+
+    res.json({ days, maxDate: (() => {
+      const d = new Date(todayAnchor.getTime() + MAX_DAYS_AHEAD * 24 * 60 * 60 * 1000);
+      return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+    })(), minDate: todayStr });
   } catch (err) {
     console.error('Ошибка получения слотов из Битрикса:', err.message);
     res.status(502).json({ error: 'bitrix_unavailable' });
@@ -245,8 +285,22 @@ app.post(BITRIX_WEBHOOK_PATH, async (req, res) => {
     const chatId = Number(deal[BITRIX_TG_FIELD_NAME]);
     if (!chatId) return res.status(422).json({ error: 'no_telegram_id_on_deal' });
 
-    const beginDate = deal.BEGINDATE; // ISO datetime со смещением зоны организации
-    const dateTimeKey = String(beginDate);
+    // ФИКС "напоминание пришло не в то время / показывает не тот час":
+    // deal.BEGINDATE — это то, что crm.deal.get ОТДАЁТ обратно, а не то, что мы сами
+    // туда положили. Bitrix не всегда возвращает его в чистом ISO+смещение — иногда
+    // это классический битриксовский "ДД.ММ.ГГГГ ЧЧ:ММ:СС". `new Date(beginDate)`
+    // в таком случае либо даёт Invalid Date, либо (что хуже и незаметнее) JS
+    // интерпретирует строку по каким-то своим догадкам — и именно так время "уезжает"
+    // на несколько часов. Используем тот же терпимый парсер, что и для календаря.
+    const dt = parseBitrixDateTime(deal.BEGINDATE, ORG_TIMEZONE);
+    if (!dt) {
+      console.error('Не удалось разобрать BEGINDATE сделки:', dealId, deal.BEGINDATE);
+      return res.status(422).json({ error: 'bad_begindate' });
+    }
+    // Храним КАНОНИЧЕСКИЙ UTC ISO (dt.toISOString()), а не сырую строку от Битрикса.
+    // Тогда cron ниже, который делает new Date(booking.dateTime), больше не зависит
+    // от того, в каком формате Битрикс отдал дату — он всегда получает однозначный UTC.
+    const dateTimeKey = dt.toISOString();
 
     // Защита от дублей: если Битрикс дёрнет этот вебхук два раза на одном переходе
     // стадии (обычное дело для автоматизаций/роботов), сообщение клиенту уйдёт только раз.
@@ -269,7 +323,6 @@ app.post(BITRIX_WEBHOOK_PATH, async (req, res) => {
     }
 
     if (!alreadySent) {
-      const dt = new Date(beginDate);
       await sendMessage(chatId, `✅ Ваша запись на встречу подтверждена на ${humanTime(dt)}!`);
     }
 
@@ -308,8 +361,31 @@ async function sendReminder(booking, kind) {
   });
 }
 
+// ФИКС "напоминание пришло дважды": флаг sentMorning/sentHour раньше выставлялся
+// ПОСЛЕ отправки. Если один тик крона ещё не успел записать флаг (сеть до
+// Telegram/Mongo подтормозила), а следующий тик (через минуту) уже стартовал —
+// оба видят sentHour:false и оба шлют сообщение. Плюс отдельная защита от
+// НАЛОЖЕНИЯ самих тиков крона, если целый проход не уложился в минуту.
+let reminderTickRunning = false;
+
+// Атомарно "забираем" право на отправку этого напоминания: обновляем флаг только
+// если он ещё false, и отправляем сообщение только если реально забрали именно мы.
+async function claimAndSend(booking, kind) {
+  const field = kind === 'morning' ? 'sentMorning' : 'sentHour';
+  // mongodb driver v6: findOneAndUpdate возвращает сам документ (или null, если
+  // ни один не подошёл под фильтр) — без обёртки {value}, как было в старых версиях.
+  const claimed = await db.collection('confirmedBookings').findOneAndUpdate(
+    { dealId: booking.dealId, [field]: false },
+    { $set: { [field]: true } },
+  );
+  if (!claimed) return; // кто-то (другой тик) уже забрал это напоминание — не шлём второй раз
+  await sendReminder(booking, kind);
+}
+
 cron.schedule('* * * * *', async () => {
   if (!db) return;
+  if (reminderTickRunning) return; // предыдущий проход ещё не закончился — пропускаем этот тик
+  reminderTickRunning = true;
   try {
     const { time, dateStr } = nowInTZ(ORG_TIMEZONE);
     const bookings = await db.collection('confirmedBookings').find({ status: 'confirmed' }).toArray();
@@ -329,18 +405,18 @@ cron.schedule('* * * * *', async () => {
 
       // Напоминание №1: с 08:00 и позже в день встречи (если ещё не отправляли)
       if (!booking.sentMorning && time >= '08:00') {
-        await sendReminder(booking, 'morning');
-        await db.collection('confirmedBookings').updateOne({ dealId: booking.dealId }, { $set: { sentMorning: true } });
+        await claimAndSend(booking, 'morning');
       }
 
       // Напоминание №2: от "за час до начала" и до самого начала встречи
       if (!booking.sentHour && time >= hourBeforeStr && time < classTimeStr) {
-        await sendReminder(booking, 'hour');
-        await db.collection('confirmedBookings').updateOne({ dealId: booking.dealId }, { $set: { sentHour: true } });
+        await claimAndSend(booking, 'hour');
       }
     }
   } catch (err) {
     console.error('Ошибка планировщика напоминаний:', err);
+  } finally {
+    reminderTickRunning = false;
   }
 });
 

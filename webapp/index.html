@@ -20,11 +20,24 @@
   select, input, button { padding: 10px; border-radius: 10px; border: 1px solid var(--tg-theme-hint-color, #ccc); font-size: 14px; }
   button { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); border: none; font-weight: 600; }
   #status { margin-top: 12px; font-size: 14px; }
+  .more-dates { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--tg-theme-hint-color, #ccc); }
+  .more-dates-label { font-weight: 600; margin-bottom: 8px; font-size: 14px; }
+  .more-dates-row { display: flex; gap: 8px; }
+  .more-dates-row input[type="date"] { flex: 1; }
+  .more-dates-row button { white-space: nowrap; }
 </style>
 </head>
 <body>
   <h1>Свободное время (из Битрикс24)</h1>
   <div id="days">Загрузка…</div>
+
+  <div class="more-dates">
+    <div class="more-dates-label">Или выберите другую дату</div>
+    <div class="more-dates-row">
+      <input type="date" id="datePicker">
+      <button type="button" id="datePickerGo">Показать</button>
+    </div>
+  </div>
 
   <form id="bookingForm">
     <div id="chosenSlot" style="font-size:14px;opacity:.7;"></div>
@@ -44,14 +57,9 @@
 
   let chosen = null;
 
-  async function loadSlots() {
-    const res = await fetch('/api/slots?initData=' + encodeURIComponent(initData));
-    if (!res.ok) { document.getElementById('days').textContent = 'Не удалось загрузить расписание из Битрикса.'; return; }
-    const data = await res.json();
-
-    const container = document.getElementById('days');
+  function renderDays(days, container) {
     container.innerHTML = '';
-    for (const day of data.days) {
+    for (const day of days) {
       const div = document.createElement('div');
       div.className = 'day';
       const slotsHtml = day.slots.length
@@ -71,6 +79,35 @@
       });
     });
   }
+
+  // Ближайшие дни идут "лентой" от сегодня (см. /api/slots на сервере) — никакой
+  // привязки к пн-вс и никаких пустых прошедших дней.
+  async function loadSlots() {
+    const res = await fetch('/api/slots?initData=' + encodeURIComponent(initData));
+    if (!res.ok) { document.getElementById('days').textContent = 'Не удалось загрузить расписание из Битрикса.'; return; }
+    const data = await res.json();
+    renderDays(data.days, document.getElementById('days'));
+
+    // Ограничиваем дата-пикер тем диапазоном, который реально можно забронировать.
+    const picker = document.getElementById('datePicker');
+    if (data.minDate) picker.min = data.minDate;
+    if (data.maxDate) picker.max = data.maxDate;
+  }
+
+  // Даты за пределами ближайшей ленты — по кнопке "Показать" одним запросом
+  // на конкретный день.
+  document.getElementById('datePickerGo').addEventListener('click', async () => {
+    const status = document.getElementById('status');
+    const picker = document.getElementById('datePicker');
+    if (!picker.value) return;
+
+    status.textContent = 'Загружаем...';
+    const res = await fetch('/api/slots?initData=' + encodeURIComponent(initData) + '&date=' + encodeURIComponent(picker.value));
+    if (!res.ok) { status.textContent = 'Не удалось загрузить эту дату.'; return; }
+    const data = await res.json();
+    status.textContent = '';
+    renderDays(data.days, document.getElementById('days'));
+  });
 
   document.getElementById('bookingForm').addEventListener('submit', async (e) => {
     e.preventDefault();

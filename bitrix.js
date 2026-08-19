@@ -27,13 +27,30 @@ function methodUrl(method) {
 }
 
 export async function bitrixCall(method, params = {}) {
-  const { data } = await axios.post(methodUrl(method), params);
-  if (data.error) {
-    const err = new Error(`Bitrix24 ${method}: ${data.error_description || data.error}`);
-    err.bitrix = data;
+  try {
+    const { data } = await axios.post(methodUrl(method), params);
+    if (data.error) {
+      const err = new Error(`Bitrix24 ${method}: ${data.error_description || data.error}`);
+      err.bitrix = data;
+      throw err;
+    }
+    return data.result;
+  } catch (err) {
+    // ФИКС "Request failed with status code 400" без деталей: когда Bitrix отвечает
+    // НЕ 200 (400/401/403/...), axios бросает исключение ДО того, как мы успеваем
+    // прочитать data.error/data.error_description — и в логах остаётся только общая
+    // фраза от axios, а реальная причина (какое поле не понравилось Bitrix'у) теряется.
+    // Здесь достаём тело ответа Bitrix, если оно есть, и кладём его в сообщение и в err.bitrix.
+    if (err.response) {
+      const body = err.response.data;
+      const detail = body?.error_description || body?.error || JSON.stringify(body);
+      const wrapped = new Error(`Bitrix24 ${method}: HTTP ${err.response.status} — ${detail}`);
+      wrapped.bitrix = body;
+      wrapped.httpStatus = err.response.status;
+      throw wrapped;
+    }
     throw err;
   }
-  return data.result;
 }
 
 // ---------- Календарь: свободное/занятое время ----------
