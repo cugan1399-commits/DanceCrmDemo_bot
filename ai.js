@@ -15,8 +15,13 @@
 //                    для прямого Gemini через Google AI Studio поставьте
 //                    https://generativelanguage.googleapis.com/v1beta/openai
 //   AI_API_KEY    — ключ OpenRouter или Google AI Studio (в зависимости от AI_BASE_URL)
-//   AI_MODEL      — напр. 'google/gemini-2.0-flash-exp:free' (OpenRouter, бесплатная)
-//                    или 'gemini-2.0-flash' (напрямую через Google AI Studio)
+//   AI_MODEL      — напр. 'openrouter/free' (авто-роутер OpenRouter — сам выбирает
+//                    бесплатную модель с поддержкой tool calling; бесплатные модели
+//                    на OpenRouter регулярно ротируются/снимаются с публикации,
+//                    поэтому жёстко прибитый ID вроде 'google/gemini-...:free' рано
+//                    или поздно начинает падать с 404 — 'openrouter/free' переживает
+//                    это автоматически) или прямой ID модели через Google AI Studio,
+//                    напр. 'gemini-2.0-flash'
 //   AI_MAX_HISTORY_MESSAGES — сколько последних сообщений диалога держим в контексте (по умолчанию 16)
 
 import axios from 'axios';
@@ -24,7 +29,7 @@ import { bitrixCall, getDeal, ORG_TIMEZONE } from './bitrix.js';
 
 const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 const AI_API_KEY = process.env.AI_API_KEY;
-const AI_MODEL = process.env.AI_MODEL || 'google/gemini-2.0-flash-exp:free';
+const AI_MODEL = process.env.AI_MODEL || 'openrouter/free';
 const AI_MAX_HISTORY_MESSAGES = Number(process.env.AI_MAX_HISTORY_MESSAGES || 16);
 
 if (!AI_API_KEY) {
@@ -229,12 +234,25 @@ async function saveHistory(db, chatId, messages) {
 // ---------- Вызов модели ----------
 
 async function callModel(messages) {
-  const { data } = await axios.post(
-    `${AI_BASE_URL}/chat/completions`,
-    { model: AI_MODEL, messages, tools: AI_TOOLS, tool_choice: 'auto' },
-    { headers: { Authorization: `Bearer ${AI_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 },
-  );
-  return data.choices[0].message;
+  try {
+    const { data } = await axios.post(
+      `${AI_BASE_URL}/chat/completions`,
+      { model: AI_MODEL, messages, tools: AI_TOOLS, tool_choice: 'auto' },
+      { headers: { Authorization: `Bearer ${AI_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 30000 },
+    );
+    return data.choices[0].message;
+  } catch (err) {
+    // ФИКС "Request failed with status code 404/401/..." без деталей: axios бросает
+    // исключение ДО того, как мы можем прочитать тело ответа (обычно там и лежит
+    // настоящая причина — "model not found", "invalid api key" и т.п.). Достаём его
+    // и кладём в сообщение, как уже сделано для bitrixCall в bitrix.js.
+    if (err.response) {
+      const body = err.response.data;
+      const detail = body?.error?.message || body?.error_description || JSON.stringify(body);
+      throw new Error(`AI API (${AI_BASE_URL}, model=${AI_MODEL}): HTTP ${err.response.status} — ${detail}`);
+    }
+    throw err;
+  }
 }
 
 const SYSTEM_PROMPT = `Ты — вежливый консультант компании в Telegram-чате. Отвечай кратко, по-русски, дружелюбно.

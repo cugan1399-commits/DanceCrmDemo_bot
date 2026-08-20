@@ -147,27 +147,31 @@ export function updateDealStage(dealId, stageId) {
 
 // ---------- Уведомление менеджера (перехват диалога человеком) ----------
 
-// ID сотрудника Битрикс24, на которого ставится срочная задача, когда ИИ передаёт
-// диалог человеку. Найти ID: Компания -> Сотрудники -> открыть карточку -> число в URL.
+// ID сотрудника Битрикс24, который назначается ответственным по сделке-эскалации.
+// Найти ID: Компания -> Сотрудники -> открыть карточку -> число в URL. Необязательно —
+// без него сделка всё равно создастся, просто без явного ответственного.
 const BITRIX_MANAGER_USER_ID = process.env.BITRIX_MANAGER_USER_ID;
 
-// Через задачу (tasks.task.add) — работает с обычным входящим вебхуком без доп. прав
-// на чаты/ботов, поэтому взято как основной способ. Если у вас настроены Открытые
-// линии и вебхук с правами imbot — можно параллельно дернуть imbot.message.add,
-// это не помешает.
-export async function notifyManagerAboutEscalation({ chatId, reason }) {
-  if (!BITRIX_MANAGER_USER_ID) {
-    console.warn('⚠️  BITRIX_MANAGER_USER_ID не задан — задача менеджеру не создана, только лог:', chatId, reason);
-    return null;
-  }
-  return bitrixCall('tasks.task.add', {
-    fields: {
-      TITLE: `⚠️ ИИ отключен в чате с пользователем. Клиент просит человека!`,
-      DESCRIPTION: `Telegram chatId: ${chatId}\nПричина: ${reason || 'не указана'}`,
-      RESPONSIBLE_ID: BITRIX_MANAGER_USER_ID,
-      PRIORITY: 2, // высокий приоритет
-    },
-  });
+// ФИКС "tasks.task.add: HTTP 401 — higher privileges than provided by the webhook
+// token": входящий вебхук у вас выдан с правами на CRM и Календарь, а не на Задачи —
+// tasks.* требует отдельный scope, которого нет и который не хочется просить
+// перевыпускать. Вместо задачи создаём обычную СДЕЛКУ через crm.deal.add — тот же
+// метод, что уже используется для записи на встречу, то есть права точно есть.
+// Это заодно даёт менеджеру ровно то, что нужно: карточку в CRM с историей диалога
+// и Telegram ID клиента, откуда удобно продолжать общение.
+export async function notifyManagerAboutEscalation({ chatId, reason, recentHistoryText }) {
+  const fields = {
+    TITLE: `⚠️ ИИ передал чат менеджеру (chatId ${chatId})`,
+    COMMENTS: [
+      `Причина: ${reason || 'не указана'}`,
+      `Telegram chatId: ${chatId}`,
+      recentHistoryText ? `\nПоследние сообщения:\n${recentHistoryText}` : null,
+    ].filter(Boolean).join('\n'),
+  };
+  if (BITRIX_MANAGER_USER_ID) fields.ASSIGNED_BY_ID = BITRIX_MANAGER_USER_ID;
+  if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
+
+  return bitrixCall('crm.deal.add', { fields });
 }
 
 export { BITRIX_TG_FIELD_NAME, BITRIX_CALENDAR_ID, BITRIX_CALENDAR_TYPE, ORG_TIMEZONE };

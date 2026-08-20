@@ -25,7 +25,7 @@ import {
   BITRIX_TG_FIELD_NAME,
   ORG_TIMEZONE,
 } from './bitrix.js';
-import { handleUserMessage, isStopWordTrigger } from './ai.js';
+import { handleUserMessage, isStopWordTrigger, loadHistory } from './ai.js';
 import {
   zonedTimeToUTC,
   hhmmInTZ,
@@ -115,13 +115,33 @@ async function setAiActive(chatId, aiActive) {
   );
 }
 
+// Собираем последние несколько сообщений диалога (см. aiConversations в ai.js) в
+// короткий читаемый текст — чтобы менеджер, открыв сделку в Битриксе, сразу видел
+// контекст, а не только голую причину эскалации.
+function formatRecentHistory(messages) {
+  if (!messages || !messages.length) return null;
+  return messages
+    .filter(m => m.role === 'user' || (m.role === 'assistant' && m.content))
+    .slice(-6)
+    .map(m => `${m.role === 'user' ? 'Клиент' : 'ИИ'}: ${String(m.content).slice(0, 300)}`)
+    .join('\n');
+}
+
 // Общая точка выключения ИИ + уведомления менеджера — вызывается и из стоп-слов,
 // и из ответа модели (escalate_to_human), поэтому вынесена отдельно.
 async function escalateToHuman(chatId, reason) {
   await setAiActive(chatId, false);
-  await notifyManagerAboutEscalation({ chatId, reason }).catch(err => {
+  try {
+    const history = await loadHistory(db, chatId);
+    const dealId = await notifyManagerAboutEscalation({
+      chatId,
+      reason,
+      recentHistoryText: formatRecentHistory(history),
+    });
+    console.log(`📋 Создана сделка-эскалация #${dealId} для chatId ${chatId} (${reason})`);
+  } catch (err) {
     console.error('Не удалось уведомить менеджера в Битриксе:', err.message);
-  });
+  }
   await sendMessage(chatId, '👤 Передаю ваш вопрос менеджеру — он подключится к чату в ближайшее время.');
 }
 
