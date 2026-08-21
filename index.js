@@ -576,7 +576,7 @@ async function handleReminderCallback(cq) {
 // Обычный текст (не команда, не нажатие инлайн-кнопки) — передаём ИИ-консультанту,
 // если он включён для этого чата. Если выключен (менеджер держит диалог руками) —
 // молча ничего не делаем, чтобы не мешать живой переписке.
-async function handleAiText(chatId, text) {
+async function handleAiText(chatId, text, username) {
   // Быстрый путь: стоп-слова клиента распознаём без обращения к модели.
   if (isStopWordTrigger(text)) {
     await escalateToHuman(chatId, 'клиент написал стоп-слово ("оператор"/"менеджер"/"человек")');
@@ -587,7 +587,7 @@ async function handleAiText(chatId, text) {
   if (!active) return; // менеджер уже ведёт чат руками — ИИ молчит
 
   try {
-    const { replyText, escalate, escalateReason } = await handleUserMessage({ db, chatId, userText: text });
+    const { replyText, escalate, escalateReason } = await handleUserMessage({ db, chatId, userText: text, username });
     if (replyText) await sendMessage(chatId, replyText);
     if (escalate) await escalateToHuman(chatId, escalateReason);
   } catch (err) {
@@ -606,13 +606,14 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
     }
     const text = update.message?.text;
     const chatId = update.message?.chat?.id;
+    const username = update.message?.from?.username;
     if (text === '/start') {
       await sendMessage(
         chatId,
         '👋 Привет! Открой мини-приложение кнопкой снизу, чтобы посмотреть свободное время и записаться на встречу, или просто напиши вопрос — отвечу.'
       );
     } else if (text && chatId) {
-      await handleAiText(chatId, text);
+      await handleAiText(chatId, text, username);
     }
   } catch (err) {
     console.error('Ошибка Telegram webhook:', err);

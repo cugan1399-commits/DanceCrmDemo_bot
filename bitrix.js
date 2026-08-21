@@ -174,4 +174,32 @@ export async function notifyManagerAboutEscalation({ chatId, reason, recentHisto
   return bitrixCall('crm.deal.add', { fields });
 }
 
+// ---------- Таймлайн сделки: лог того, что клиент спрашивал у ИИ ----------
+
+// Используем crm.timeline.comment.add, а НЕ перезапись поля COMMENTS в самой сделке
+// (см. dealFields выше) — так вопросы клиента к ИИ копятся отдельной историей в
+// таймлайне сделки (вкладка "История" в карточке), не затирая тему встречи/телефон,
+// которые уже занимают COMMENTS.
+export async function addDealComment(dealId, text) {
+  if (!dealId) return;
+  return bitrixCall('crm.timeline.comment.add', {
+    fields: { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: text },
+  });
+}
+
+// Лёгкая сделка "интерес к товару" — создаётся ИИ-консультантом (см. ai.js), когда
+// клиент впервые спрашивает про товар, а у него ещё нет "живой" сделки в
+// activeBookingByChat. Не дублирует поля встречи (BEGINDATE/CLOSEDATE) — это НЕ
+// бронирование, а просто карточка для менеджера, которая позже может либо
+// превратиться в сделку встречи (если клиент запишется — см. /api/book), либо
+// остаться как есть, если он просто спрашивал.
+export async function createInterestDeal({ chatId, username }) {
+  const fields = {
+    TITLE: `Интерес к товару — ${username ? '@' + username : `Telegram ${chatId}`}`,
+    COMMENTS: username ? `Telegram: @${username}` : `Telegram chatId: ${chatId}`,
+  };
+  if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
+  return bitrixCall('crm.deal.add', { fields });
+}
+
 export { BITRIX_TG_FIELD_NAME, BITRIX_CALENDAR_ID, BITRIX_CALENDAR_TYPE, ORG_TIMEZONE };

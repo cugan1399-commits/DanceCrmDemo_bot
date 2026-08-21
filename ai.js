@@ -25,7 +25,7 @@
 //   AI_MAX_HISTORY_MESSAGES — сколько последних сообщений диалога держим в контексте (по умолчанию 16)
 
 import axios from 'axios';
-import { bitrixCall, getDeal, ORG_TIMEZONE } from './bitrix.js';
+import { bitrixCall, getDeal, addDealComment, createInterestDeal, ORG_TIMEZONE } from './bitrix.js';
 
 const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 const AI_API_KEY = process.env.AI_API_KEY;
@@ -169,7 +169,37 @@ async function fetchPricesByProductIds(productIds) {
   return map;
 }
 
-async function toolCheckProductCatalog({ search_query }) {
+// ФИКС "менеджер не видит, о чём клиент спрашивал ИИ": каждый вопрос про товар
+// логируем комментарием в таймлайн сделки этого клиента. Если у него ЕЩЁ НЕТ
+// сделки (не записывался на встречу) — создаём лёгкую сделку "интерес к товару"
+// прямо сейчас и регистрируем её в activeBookingByChat как "живую" сделку клиента.
+// Дальше это та самая единственная сделка на chatId: если клиент всё же запишется
+// на встречу, /api/book найдёт её через activeBookingByChat и обновит на месте
+// (см. комментарий в /api/book про "ровно одна живая сделка на chatId"), а история
+// вопросов в таймлайне при этом никуда не денется — она лежит отдельно от полей
+// сделки, которые перезаписываются при бронировании.
+// Ошибку логирования НЕ даём проронить наружу — клиент должен получить ответ по
+// каталогу в любом случае, даже если запись в Битрикс не удалась.
+async function logProductInterestToDeal({ chatId, db, username, search_query, summary }) {
+  if (!db || !chatId) return;
+  try {
+    let active = await db.collection('activeBookingByChat').findOne({ chatId });
+    if (!active?.dealId) {
+      const dealId = await createInterestDeal({ chatId, username });
+      await db.collection('activeBookingByChat').updateOne(
+        { chatId },
+        { $set: { chatId, dealId } },
+        { upsert: true },
+      );
+      active = { chatId, dealId };
+    }
+    await addDealComment(active.dealId, `🔎 Клиент спросил ИИ про товар: "${search_query}"\n${summary}`);
+  } catch (err) {
+    console.error('Не удалось залогировать интерес к товару в сделку:', err.message);
+  }
+}
+
+async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
   try {
     const iblockId = await resolveCatalogIblockId();
     const products = await bitrixCall('catalog.product.list', {
@@ -179,7 +209,9 @@ async function toolCheckProductCatalog({ search_query }) {
     // catalog.product.list оборачивает результат в { products: [...] }
     const list = products?.products || products || [];
     if (!list.length) {
-      return `Товары по запросу "${search_query}" в каталоге не найдены.`;
+      const notFoundText = `Товары по запросу "${search_query}" в каталоге не найдены.`;
+      await logProductInterestToDeal({ chatId, db, username, search_query, summary: notFoundText });
+      return notFoundText;
     }
     const pricesByProductId = await fetchPricesByProductIds(list.map(p => p.id));
     const lines = list.slice(0, 8).map(p => {
@@ -190,7 +222,9 @@ async function toolCheckProductCatalog({ search_query }) {
       const desc = text ? ` — ${String(text).slice(0, 200)}` : '';
       return `• ${p.name}: ${price}${stock}${desc}`;
     });
-    return `Найдено в каталоге:\n${lines.join('\n')}`;
+    const resultText = `Найдено в каталоге:\n${lines.join('\n')}`;
+    await logProductInterestToDeal({ chatId, db, username, search_query, summary: resultText });
+    return resultText;
   } catch (err) {
     console.error('Инструмент check_product_catalog упал:', err.message);
     return 'Не удалось получить каталог из Битрикса (техническая ошибка). Предложи клиенту уточнить у менеджера.';
@@ -290,7 +324,7 @@ const SYSTEM_PROMPT = `Ты — вежливый консультант комп
 // Возвращает { replyText, escalate, escalateReason }.
 // replyText — что отправить клиенту (может быть null, если только эскалация).
 // escalate — true, если нужно выключить aiActive и позвать менеджера.
-export async function handleUserMessage({ db, chatId, userText }) {
+export async function handleUserMessage({ db, chatId, userText, username }) {
   const history = await loadHistory(db, chatId);
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
@@ -323,7 +357,7 @@ export async function handleUserMessage({ db, chatId, userText }) {
       if (!fn) {
         resultText = `Неизвестный инструмент: ${call.function.name}`;
       } else {
-        resultText = await fn({ ...args, chatId, db });
+        resultText = await fn({ ...args, chatId, db, username });
       }
 
       const escMatch = /^\[\[ESCALATED:(.*)\]\]$/.exec(resultText);
