@@ -148,20 +148,43 @@ export const AI_TOOLS = [
 // crm.product.list — переключено на catalog.product.list, так как реальные
 // тестовые товары (Nike Air Force 1, Adidas Superstar) заведены именно в
 // коммерческий каталог.
+// ФИКС "цена не указана" при явно заданной цене в товаре: в коммерческом каталоге
+// Битрикс24 цена — ОТДЕЛЬНАЯ сущность (метод catalog.price.*), а не поле самого
+// товара, поэтому catalog.product.list физически не может её вернуть, сколько бы
+// полей мы ни перечисляли в select. Нужен второй запрос — catalog.price.list — по
+// найденным productId, и результат нужно склеить с товарами вручную.
+async function fetchPricesByProductIds(productIds) {
+  if (!productIds.length) return new Map();
+  const raw = await bitrixCall('catalog.price.list', {
+    select: ['productId', 'price', 'currency'],
+    filter: { '@productId': productIds },
+  });
+  const list = raw?.prices || raw || [];
+  const map = new Map();
+  for (const p of list) {
+    // Если у товара несколько типов цен (розница/опт), берём первую попавшуюся —
+    // для этого демо-бота нам не нужно спрашивать клиента, какая именно цена нужна.
+    if (!map.has(p.productId)) map.set(p.productId, p);
+  }
+  return map;
+}
+
 async function toolCheckProductCatalog({ search_query }) {
   try {
     const iblockId = await resolveCatalogIblockId();
     const products = await bitrixCall('catalog.product.list', {
-  select: ['id', 'iblockId', 'name', 'price', 'previewText', 'detailText', 'quantity'],
-  filter: { iblockId, '%name': search_query },
-});
+      select: ['id', 'iblockId', 'name', 'previewText', 'detailText', 'quantity'],
+      filter: { iblockId, '%name': search_query }, // поиск по частичному совпадению названия
+    });
     // catalog.product.list оборачивает результат в { products: [...] }
     const list = products?.products || products || [];
     if (!list.length) {
       return `Товары по запросу "${search_query}" в каталоге не найдены.`;
     }
+    const pricesByProductId = await fetchPricesByProductIds(list.map(p => p.id));
     const lines = list.slice(0, 8).map(p => {
-      const price = p.price != null ? `${p.price} ${p.currency || ''}`.trim() : 'цена не указана';
+      const priceEntry = pricesByProductId.get(p.id);
+      const price = priceEntry ? `${priceEntry.price} ${priceEntry.currency || ''}`.trim() : 'цена не указана';
       const stock = p.quantity != null ? `, остаток: ${p.quantity} шт.` : '';
       const text = p.previewText || p.detailText;
       const desc = text ? ` — ${String(text).slice(0, 200)}` : '';
