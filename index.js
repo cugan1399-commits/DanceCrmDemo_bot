@@ -22,6 +22,7 @@ import {
   getDeal,
   updateDealStage,
   notifyManagerAboutEscalation,
+  addDealComment,
   BITRIX_TG_FIELD_NAME,
   ORG_TIMEZONE,
 } from './bitrix.js';
@@ -640,6 +641,129 @@ app.post('/api/manager/resume-ai', async (req, res) => {
   await setAiActive(Number(chatId) || chatId, true);
   await sendMessage(Number(chatId) || chatId, '🤖 Снова на связи — чем могу помочь?').catch(() => {});
   res.json({ ok: true });
+});
+
+// ===================== Лёгкий релей "менеджер -> клиент в Telegram" =====================
+//
+// POST /api/manager/reply  { dealId? , chatId?, text }  header: X-Manager-Token: <MANAGER_API_TOKEN>
+// Принимает ЛИБО dealId (тогда chatId ищем сами — сначала в своей БД, как в /webhook/bitrix,
+// потом как запасной вариант читаем поле с телеграм-ID прямо из сделки), ЛИБО готовый chatId.
+// Выключает ИИ для этого чата (чтобы не отвечал поверх менеджера) и логирует ответ в
+// таймлайн сделки — тем же способом, что и вопросы клиента к ИИ (см. ai.js).
+app.post('/api/manager/reply', async (req, res) => {
+  const token = req.header('X-Manager-Token') || req.query.token || req.body?.token;
+  if (!MANAGER_API_TOKEN || token !== MANAGER_API_TOKEN) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  const text = req.body?.text;
+  const dealId = req.body?.dealId ?? req.query.dealId;
+  let chatId = req.body?.chatId ?? req.query.chatId;
+  if (!text) return res.status(400).json({ error: 'no_text' });
+  if (!chatId && !dealId) return res.status(400).json({ error: 'no_chat_id_or_deal_id' });
+
+  try {
+    if (!chatId) {
+      const info = db ? await db.collection('dealBookingInfo').findOne({ dealId: String(dealId) }) : null;
+      if (info) {
+        chatId = info.chatId;
+      } else {
+        const deal = await getDeal(dealId);
+        chatId = Number(deal[BITRIX_TG_FIELD_NAME]);
+      }
+    }
+    if (!chatId) return res.status(422).json({ error: 'chat_id_not_found' });
+    chatId = Number(chatId) || chatId;
+
+    await setAiActive(chatId, false);
+    await sendMessage(chatId, text);
+
+    // Логируем ответ менеджера в таймлайн той же сделки, что и вопросы к ИИ (см. ai.js) —
+    // dealId либо пришёл явно, либо достаём его из activeBookingByChat по chatId.
+    try {
+      const resolvedDealId = dealId || (db ? (await db.collection('activeBookingByChat').findOne({ chatId }))?.dealId : null);
+      if (resolvedDealId) await addDealComment(resolvedDealId, `👤 Менеджер ответил клиенту: ${text}`);
+    } catch (err) {
+      console.error('Не удалось залогировать ответ менеджера в сделку:', err.message);
+    }
+
+    res.json({ ok: true, chatId });
+  } catch (err) {
+    console.error('Ошибка отправки ответа менеджера:', err.message);
+    res.status(502).json({ error: 'send_failed' });
+  }
+});
+
+// GET /manager — простая HTML-форма для ручного ответа клиенту в Telegram прямо из
+// браузера (без сборки фронтенда). Токен хранится только в браузере менеджера, на
+// сервере не логируется. Для демо-проекта достаточно; для продакшена стоит поставить
+// нормальную авторизацию поверх этой страницы (например, Basic Auth на уровне Express).
+app.get('/manager', (req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ответ клиенту в Telegram</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin-top: 16px; font-weight: 600; }
+  input, textarea { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; font-size: 16px; }
+  textarea { min-height: 100px; }
+  button { margin-top: 20px; padding: 10px 20px; font-size: 16px; cursor: pointer; }
+  #status { margin-top: 12px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h2>Ответ клиенту в Telegram</h2>
+  <label>Токен менеджера
+    <input id="token" type="password" placeholder="MANAGER_API_TOKEN">
+  </label>
+  <label>ID сделки в Битриксе
+    <input id="dealId" type="text" placeholder="например, 35">
+  </label>
+  <label>Сообщение клиенту
+    <textarea id="text" placeholder="Введите ответ..."></textarea>
+  </label>
+  <button onclick="sendReply()">Отправить в Telegram</button>
+  <div id="status"></div>
+
+<script>
+async function sendReply() {
+  const token = document.getElementById('token').value.trim();
+  const dealId = document.getElementById('dealId').value.trim();
+  const text = document.getElementById('text').value.trim();
+  const statusEl = document.getElementById('status');
+  if (!token || !dealId || !text) {
+    statusEl.textContent = 'Заполните все поля.';
+    statusEl.style.color = 'red';
+    return;
+  }
+  statusEl.textContent = 'Отправляю...';
+  statusEl.style.color = 'black';
+  try {
+    const res = await fetch('/api/manager/reply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Manager-Token': token },
+      body: JSON.stringify({ dealId, text }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      statusEl.textContent = 'Отправлено!';
+      statusEl.style.color = 'green';
+      document.getElementById('text').value = '';
+    } else {
+      statusEl.textContent = 'Ошибка: ' + (data.error || res.status);
+      statusEl.style.color = 'red';
+    }
+  } catch (err) {
+    statusEl.textContent = 'Ошибка сети: ' + err.message;
+    statusEl.style.color = 'red';
+  }
+}
+</script>
+</body>
+</html>`);
 });
 
 const PORT = process.env.PORT || 3000;
