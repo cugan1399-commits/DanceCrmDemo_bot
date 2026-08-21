@@ -152,9 +152,9 @@ async function toolCheckProductCatalog({ search_query }) {
   try {
     const iblockId = await resolveCatalogIblockId();
     const products = await bitrixCall('catalog.product.list', {
-      select: ['id', 'name', 'price', 'previewText', 'detailText', 'quantity'],
-      filter: { iblockId, '%name': search_query }, // поиск по частичному совпадению названия
-    });
+  select: ['id', 'iblockId', 'name', 'price', 'previewText', 'detailText', 'quantity'],
+  filter: { iblockId, '%name': search_query },
+});
     // catalog.product.list оборачивает результат в { products: [...] }
     const list = products?.products || products || [];
     if (!list.length) {
