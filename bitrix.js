@@ -290,17 +290,44 @@ export async function createOrderDeal({ chatId, username, contactId, productName
 // Он не абсолютный и не содержит токен вебхука — достраиваем его сами, подставляя
 // тот же хост+токен, что уже используется во всех остальных вызовах (BITRIX_WEBHOOK_URL).
 export async function getProductPhotoUrl(productId) {
-  const raw = await bitrixCall('catalog.product.get', {
-    id: productId,
-    select: ['id', 'previewPicture', 'detailPicture'],
-  });
-  const product = raw?.product || raw;
-  const picture = product?.detailPicture || product?.previewPicture;
+  const picture = await findProductOrOfferPicture(productId);
   if (!picture?.url) return null;
 
   const queryIndex = picture.url.indexOf('?');
   const query = queryIndex >= 0 ? picture.url.slice(queryIndex) : '';
   return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+}
+
+// ФИКС "у товара с вариациями фото не находится, хотя оно точно загружено": в
+// Битриксе, если у товара включены варианты размера/цвета, реальное фото (то, что
+// видно в разделе "Вариации" карточки товара) хранится на КОНКРЕТНОЙ вариации
+// (сущность catalog.product.offer, отдельная от самого товара) — а не на самом
+// товаре. Поэтому если у товара своей картинки нет — ищем среди его вариаций
+// (catalog.product.offer.list с filter.parentId) и берём фото первой, у которой
+// оно реально загружено.
+async function findProductOrOfferPicture(productId) {
+  const raw = await bitrixCall('catalog.product.get', {
+    id: productId,
+    select: ['id', 'previewPicture', 'detailPicture'],
+  });
+  const product = raw?.product || raw;
+  const ownPicture = product?.detailPicture || product?.previewPicture;
+  if (ownPicture?.url) return ownPicture;
+
+  try {
+    const offersRaw = await bitrixCall('catalog.product.offer.list', {
+      filter: { parentId: productId },
+      select: ['id', 'previewPicture', 'detailPicture'],
+    });
+    const offers = offersRaw?.offers || offersRaw || [];
+    for (const offer of offers) {
+      const offerPicture = offer?.detailPicture || offer?.previewPicture;
+      if (offerPicture?.url) return offerPicture;
+    }
+  } catch (err) {
+    console.error(`Не удалось получить вариации товара #${productId} для поиска фото:`, err.message);
+  }
+  return null;
 }
 
 // ---------- Ответ менеджера прямо из поля сделки ----------
