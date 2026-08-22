@@ -398,7 +398,15 @@ async function saveHistory(db, chatId, messages) {
 
 // ---------- Вызов модели ----------
 
-async function callModel(messages) {
+// ФИКС "ИИ спрыгнул на простом вопросе (зовёт менеджера из-за технической заминки)":
+// раньше ЛЮБОЙ сбой запроса к модели (таймаут, сеть моргнула, 429 — превышен лимит
+// запросов у бесплатной/дешёвой модели, 5xx — сервер модели прилёг) сразу валил
+// весь диалог в escalate_to_human, хотя чаще всего достаточно повторить запрос
+// через секунду. Ретраим только ВРЕМЕННЫЕ причины (нет ответа вообще / 429 / 5xx),
+// максимум 2 раза с небольшой паузой — а не сдаёмся сразу; настоящие ошибки
+// (400 — сломанный запрос, 401 — неверный ключ и т.п.) как и раньше прокидываем
+// наверх без пересылки, ретраить их бессмысленно.
+async function callModel(messages, attempt = 1) {
   try {
     const { data } = await axios.post(
       `${AI_BASE_URL}/chat/completions`,
@@ -407,6 +415,13 @@ async function callModel(messages) {
     );
     return data.choices[0].message;
   } catch (err) {
+    const status = err.response?.status;
+    const isTransient = !err.response || status === 429 || status >= 500;
+    if (isTransient && attempt < 3) {
+      console.warn(`⚠️  Сбой запроса к ИИ (попытка ${attempt}, status=${status ?? 'нет ответа'}), пробую ещё раз...`);
+      await new Promise(resolve => setTimeout(resolve, 800 * attempt));
+      return callModel(messages, attempt + 1);
+    }
     // ФИКС "Request failed with status code 404/401/..." без деталей: axios бросает
     // исключение ДО того, как мы можем прочитать тело ответа (обычно там и лежит
     // настоящая причина — "model not found", "invalid api key" и т.п.). Достаём его
@@ -414,7 +429,7 @@ async function callModel(messages) {
     if (err.response) {
       const body = err.response.data;
       const detail = body?.error?.message || body?.error_description || JSON.stringify(body);
-      throw new Error(`AI API (${AI_BASE_URL}, model=${AI_MODEL}): HTTP ${err.response.status} — ${detail}`);
+      throw new Error(`AI API (${AI_BASE_URL}, model=${AI_MODEL}): HTTP ${status} — ${detail}`);
     }
     throw err;
   }
