@@ -289,8 +289,8 @@ export async function createOrderDeal({ chatId, username, contactId, productName
 // путь вида "/rest/catalog.product.download?fields[fieldName]=...&fields[fileId]=...".
 // Он не абсолютный и не содержит токен вебхука — достраиваем его сами, подставляя
 // тот же хост+токен, что уже используется во всех остальных вызовах (BITRIX_WEBHOOK_URL).
-export async function getProductPhotoUrl(productId) {
-  const picture = await findProductOrOfferPicture(productId);
+export async function getProductPhotoUrl(productId, iblockId) {
+  const picture = await findProductOrOfferPicture(productId, iblockId);
   if (!picture?.url) return null;
 
   const queryIndex = picture.url.indexOf('?');
@@ -303,9 +303,12 @@ export async function getProductPhotoUrl(productId) {
 // видно в разделе "Вариации" карточки товара) хранится на КОНКРЕТНОЙ вариации
 // (сущность catalog.product.offer, отдельная от самого товара) — а не на самом
 // товаре. Поэтому если у товара своей картинки нет — ищем среди его вариаций
-// (catalog.product.offer.list с filter.parentId) и берём фото первой, у которой
-// оно реально загружено.
-async function findProductOrOfferPicture(productId) {
+// (catalog.product.offer.list) и берём фото первой, у которой оно реально
+// загружено. iblockId обязателен И в select, И в filter — Bitrix отклоняет запрос
+// без него в обоих местах (проверено на реальных ответах API), поэтому его нужно
+// передать снаружи (см. вызов из ai.js — там он уже вычислен через
+// resolveCatalogIblockId для поиска по каталогу).
+async function findProductOrOfferPicture(productId, iblockId) {
   const raw = await bitrixCall('catalog.product.get', {
     id: productId,
     select: ['id', 'previewPicture', 'detailPicture'],
@@ -316,7 +319,7 @@ async function findProductOrOfferPicture(productId) {
 
   try {
     const offersRaw = await bitrixCall('catalog.product.offer.list', {
-      filter: { parentId: productId },
+      filter: { parentId: productId, iblockId },
       select: ['id', 'iblockId', 'previewPicture', 'detailPicture'],
     });
     const offers = offersRaw?.offers || offersRaw || [];
