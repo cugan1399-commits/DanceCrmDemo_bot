@@ -30,7 +30,13 @@ import {
   ORG_TIMEZONE,
 } from './bitrix.js';
 import { handleUserMessage, isStopWordTrigger, loadHistory } from './ai.js';
-import { ensureContact } from './contacts.js';
+import { ensureContact, getActiveDealIfOpen, setActiveDeal } from './contacts.js';
+
+// Отдельный от встречи и от интереса к товару кеш "активной сделки" — см.
+// подробный комментарий у getActiveDealIfOpen в contacts.js про то, почему у
+// каждого типа обращения (встреча / интерес к товару / эскалация) своя коллекция,
+// а не одна общая.
+const ESCALATION_DEAL_COLLECTION = 'activeEscalationDealByChat';
 import {
   zonedTimeToUTC,
   hhmmInTZ,
@@ -90,8 +96,13 @@ async function connectDB() {
   // а не из ответа Битрикса — так баг с некорректным часом устраняется полностью,
   // а не только чинится парсинг очередного формата даты.
   await db.collection('dealBookingInfo').createIndex({ dealId: 1 }, { unique: true });
-  // Ровно одна "живая" сделка на chatId — на ней и держится защита от дублей при переносе времени.
+  // Ровно одна "живая" сделка ВСТРЕЧИ на chatId — на ней держится защита от дублей при переносе времени.
   await db.collection('activeBookingByChat').createIndex({ chatId: 1 }, { unique: true });
+  // Ровно одна "живая" сделка ИНТЕРЕСА К ТОВАРУ на chatId — своя, отдельная от встречи
+  // (см. logProductInterestToDeal в ai.js и комментарий у getActiveDealIfOpen в contacts.js).
+  await db.collection('activeInterestDealByChat').createIndex({ chatId: 1 }, { unique: true });
+  // Ровно одна "живая" сделка-ЭСКАЛАЦИЯ на chatId — тоже своя, отдельная от двух выше.
+  await db.collection('activeEscalationDealByChat').createIndex({ chatId: 1 }, { unique: true });
   // Состояние ИИ-консультанта по чату: { chatId, aiActive, updatedAt }.
   // aiActive=true по умолчанию — на новые чаты отвечает ИИ, пока его не выключит
   // либо стоп-слово клиента, либо сама модель через escalate_to_human, либо менеджер вручную.
@@ -134,40 +145,22 @@ function formatRecentHistory(messages) {
     .join('\n');
 }
 
-// Есть ли у чата ещё "живая" (не закрытая) сделка — та же activeBookingByChat, что
-// используется для записи на встречу и интереса к товару (см. /api/book, ai.js).
-// deal.CLOSED — стандартное поле Битрикса, само становится 'Y' на финальных стадиях
-// воронки (успех/отказ), независимо от того, какие конкретно ID стадий вы завели —
-// поэтому не завязываемся на конкретные STAGE_* константы из .env.
-async function getActiveDealIfOpen(chatId) {
-  if (!db) return null;
-  const active = await db.collection('activeBookingByChat').findOne({ chatId });
-  if (!active?.dealId) return null;
-  try {
-    const deal = await getDeal(active.dealId);
-    if (deal?.CLOSED === 'Y') return null; // сделка завершена — для эскалации её как "активную" не считаем
-    return active.dealId;
-  } catch (err) {
-    // сделку не нашли (удалили руками при тестах и т.п.) — считаем, что активной нет
-    console.warn(`⚠️  Не удалось проверить статус сделки #${active.dealId} для chatId ${chatId}, считаю её неактивной:`, err.message);
-    return null;
-  }
-}
-
 // Общая точка выключения ИИ + уведомления менеджера — вызывается и из стоп-слов,
 // и из ответа модели (escalate_to_human), поэтому вынесена отдельно.
 //
-// Если у клиента уже есть НЕЗАКРЫТАЯ сделка (неважно, встреча это или интерес к
-// товару) — эскалация просто логируется комментарием в неё, вторая сделка не
-// создаётся. Если активной сделки нет (первое обращение) или прошлая уже завершена
-// (клиент написал спустя время после закрытой сделки) — создаётся новая, и она же
-// становится новой "активной" сделкой чата (как и с интересом к товару — см. ai.js).
+// Если у клиента уже есть НЕЗАКРЫТАЯ сделка-эскалация (см. ESCALATION_DEAL_COLLECTION
+// и getActiveDealIfOpen в contacts.js) — эскалация просто логируется комментарием в
+// неё, вторая сделка не создаётся. Если активной эскалации нет (первое обращение)
+// или прошлая уже завершена (клиент написал спустя время после закрытой сделки) —
+// создаётся новая. ВАЖНО: это отдельный от встречи и от интереса к товару кеш —
+// эскалация никогда не цепляется за сделку встречи/покупки, только за свою же
+// предыдущую эскалацию, если та ещё не закрыта.
 async function escalateToHuman(chatId, reason, username) {
   await setAiActive(chatId, false);
   try {
     const history = await loadHistory(db, chatId);
     const recentHistoryText = formatRecentHistory(history);
-    const existingDealId = await getActiveDealIfOpen(chatId);
+    const existingDealId = await getActiveDealIfOpen({ db, chatId, collection: ESCALATION_DEAL_COLLECTION });
 
     if (existingDealId) {
       await addDealComment(existingDealId, [
@@ -182,13 +175,7 @@ async function escalateToHuman(chatId, reason, username) {
         return null;
       });
       const dealId = await notifyManagerAboutEscalation({ chatId, reason, recentHistoryText, contactId });
-      if (db) {
-        await db.collection('activeBookingByChat').updateOne(
-          { chatId },
-          { $set: { chatId, dealId } },
-          { upsert: true },
-        );
-      }
+      await setActiveDeal({ db, chatId, dealId, collection: ESCALATION_DEAL_COLLECTION });
       console.log(`📋 Создана новая сделка-эскалация #${dealId} для chatId ${chatId} (${reason})`);
     }
   } catch (err) {
@@ -590,6 +577,56 @@ cron.schedule('* * * * *', async () => {
   }
 });
 
+// ===================== Авто-возврат ИИ после паузы менеджера =====================
+//
+// "Навсегда молчит, пока не включат вручную" — неудобно и для теста, и в бою
+// (менеджер может просто забыть вернуть ИИ обратно). Вместо этого: если с момента
+// ПОСЛЕДНЕГО действия менеджера/эскалации (aiChatStatus.updatedAt) прошло
+// AI_AUTO_RESUME_MINUTES — ИИ включается сам.
+//
+// Почему можно опираться на updatedAt, ничего больше не храня: setAiActive(false)
+// вызывается и при самой эскалации, и при каждом ответе менеджера — что через
+// /api/manager/reply, что через опрос поля сделки (pollManagerReplies выше). То
+// есть updatedAt и так уже "время последнего события со стороны менеджера" — пока
+// менеджер отвечает, таймер сам постоянно сдвигается вперёд и не срабатывает;
+// сработает только тогда, когда менеджер реально перестал писать.
+//
+// AI_AUTO_RESUME_MINUTES=0 (или не задан) — функция выключена, поведение как раньше.
+const AI_AUTO_RESUME_MINUTES = Number(process.env.AI_AUTO_RESUME_MINUTES || 60);
+let autoResumeTickRunning = false;
+
+cron.schedule('* * * * *', async () => {
+  if (!db || !AI_AUTO_RESUME_MINUTES) return;
+  if (autoResumeTickRunning) return; // предыдущий проход ещё не закончился — пропускаем этот тик
+  autoResumeTickRunning = true;
+  try {
+    const cutoff = new Date(Date.now() - AI_AUTO_RESUME_MINUTES * 60 * 1000);
+    const stale = await db.collection('aiChatStatus')
+      .find({ aiActive: false, updatedAt: { $lte: cutoff } })
+      .toArray();
+
+    for (const doc of stale) {
+      // Та же атомарная "заявка на право включить" через findOneAndUpdate с условием
+      // в фильтре, что и у напоминаний (claimAndSend выше) — если несколько тиков
+      // вдруг наложатся, сообщение клиенту уйдёт только один раз.
+      const claimed = await db.collection('aiChatStatus').findOneAndUpdate(
+        { chatId: doc.chatId, aiActive: false, updatedAt: { $lte: cutoff } },
+        { $set: { aiActive: true, updatedAt: new Date() } },
+      );
+      if (!claimed) continue;
+
+      await sendMessage(doc.chatId, '🤖 Снова на связи — чем могу помочь?').catch(err =>
+        console.error(`Не удалось отправить сообщение об авто-возврате ИИ (chatId ${doc.chatId}):`, err.message)
+      );
+      console.log(`🤖 ИИ автоматически включён обратно для chatId ${doc.chatId} (менеджер молчал ${AI_AUTO_RESUME_MINUTES} мин.)`);
+    }
+  } catch (err) {
+    console.error('Ошибка авто-включения ИИ:', err.message);
+  } finally {
+    autoResumeTickRunning = false;
+  }
+});
+
 // ===================== Ответ менеджера прямо из поля сделки =====================
 //
 // Менеджер открывает сделку в Битриксе, пишет текст в поле "Ответ клиенту в
@@ -705,7 +742,9 @@ async function handleReminderCallback(cq) {
 
 // Обычный текст (не команда, не нажатие инлайн-кнопки) — передаём ИИ-консультанту,
 // если он включён для этого чата. Если выключен (менеджер держит диалог руками) —
-// молча ничего не делаем, чтобы не мешать живой переписке.
+// молча ничего не делаем, чтобы не мешать живой переписке; сам ИИ вернётся, когда
+// менеджер надолго замолчит (см. крон авто-возврата выше) либо когда его включат
+// вручную через /api/manager/resume-ai.
 async function handleAiText(chatId, text, username) {
   // Быстрый путь: стоп-слова клиента распознаём без обращения к модели.
   if (isStopWordTrigger(text)) {

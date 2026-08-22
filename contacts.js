@@ -15,7 +15,7 @@
 // от одного клиента почти одновременно -> два Contact вместо одного", потому что
 // после первого успешного создания дальнейшие вызовы используют уже сохранённый ID,
 // а не переспрашивают Битрикс.
-import { findContactByChatId, createContact, updateContact } from './bitrix.js';
+import { findContactByChatId, createContact, updateContact, getDeal } from './bitrix.js';
 
 export async function ensureContact({ db, chatId, username, name, phone }) {
   if (!chatId) return null;
@@ -60,4 +60,42 @@ export async function ensureContact({ db, chatId, username, name, phone }) {
     );
   }
   return contactId;
+}
+
+// ---------- "Активная" сделка по chatId — отдельно для каждого ТИПА обращения ----------
+//
+// ВАЖНО: у записи на встречу, интереса к товару и эскалации к менеджеру — РАЗНЫЕ
+// коллекции-кеши (передаются параметром collection), а не одна общая. Изначально
+// все три сценария делили одну и ту же коллекцию (activeBookingByChat), из-за чего
+// вопрос "а сколько стоят кроссовки?", заданный уже ПОСЛЕ того как клиент записался
+// на встречу, добавлял комментарий в СДЕЛКУ ВСТРЕЧИ вместо того чтобы завести
+// отдельную сделку "Интерес к товару" — то есть в CRM встреча и покупка кроссовок
+// выглядели одним и тем же обращением. Три раздельных кеша это чинят: каждый тип
+// обращения ведёт свою сделку, все они просто ссылаются на один Contact (см. выше).
+//
+// deal.CLOSED — стандартное поле Битрикса, само становится 'Y' на финальных стадиях
+// воронки (успех/отказ), не завязано на конкретные ID стадий из .env: если сделка
+// такого типа уже закрыта, следующее обращение того же типа заводит новую, а не
+// дописывается в закрытую.
+export async function getActiveDealIfOpen({ db, chatId, collection }) {
+  if (!db) return null;
+  const active = await db.collection(collection).findOne({ chatId });
+  if (!active?.dealId) return null;
+  try {
+    const deal = await getDeal(active.dealId);
+    if (deal?.CLOSED === 'Y') return null;
+    return active.dealId;
+  } catch (err) {
+    console.warn(`⚠️  Не удалось проверить статус сделки #${active.dealId} (chatId ${chatId}, ${collection}), считаю её неактивной:`, err.message);
+    return null;
+  }
+}
+
+export async function setActiveDeal({ db, chatId, dealId, collection }) {
+  if (!db) return;
+  await db.collection(collection).updateOne(
+    { chatId },
+    { $set: { chatId, dealId } },
+    { upsert: true },
+  );
 }

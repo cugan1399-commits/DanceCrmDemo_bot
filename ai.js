@@ -26,7 +26,12 @@
 
 import axios from 'axios';
 import { bitrixCall, getDeal, addDealComment, createInterestDeal, ORG_TIMEZONE } from './bitrix.js';
-import { ensureContact } from './contacts.js';
+import { ensureContact, getActiveDealIfOpen, setActiveDeal } from './contacts.js';
+
+// Отдельный от встречи (activeBookingByChat в index.js) кеш "активной сделки" —
+// см. подробный комментарий у getActiveDealIfOpen в contacts.js про то, почему
+// их нельзя было делить на одну коллекцию.
+const INTEREST_DEAL_COLLECTION = 'activeInterestDealByChat';
 
 const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 const AI_API_KEY = process.env.AI_API_KEY;
@@ -171,34 +176,29 @@ async function fetchPricesByProductIds(productIds) {
 }
 
 // ФИКС "менеджер не видит, о чём клиент спрашивал ИИ": каждый вопрос про товар
-// логируем комментарием в таймлайн сделки этого клиента. Если у него ЕЩЁ НЕТ
-// сделки (не записывался на встречу) — создаём лёгкую сделку "интерес к товару"
-// прямо сейчас и регистрируем её в activeBookingByChat как "живую" сделку клиента.
-// Дальше это та самая единственная сделка на chatId: если клиент всё же запишется
-// на встречу, /api/book найдёт её через activeBookingByChat и обновит на месте
-// (см. комментарий в /api/book про "ровно одна живая сделка на chatId"), а история
-// вопросов в таймлайне при этом никуда не денется — она лежит отдельно от полей
-// сделки, которые перезаписываются при бронировании.
+// логируем комментарием в таймлайн сделки этого клиента. Сделка "интерес к товару"
+// живёт в СВОЁМ кеше (INTEREST_DEAL_COLLECTION), отдельном от кеша встречи — иначе
+// вопрос "сколько стоят кроссовки?", заданный уже после того как клиент записался
+// на встречу, ложился комментарием в сделку ВСТРЕЧИ вместо отдельной сделки по
+// товару (было именно так, пока обе сделки делили одну коллекцию — см. подробности
+// у getActiveDealIfOpen в contacts.js). Если у чата ещё нет открытой сделки такого
+// типа — создаём новую; если есть — просто дописываем комментарий в неё, так что
+// несколько вопросов подряд про разные товары не плодят сделки-дубли.
 // Ошибку логирования НЕ даём проронить наружу — клиент должен получить ответ по
 // каталогу в любом случае, даже если запись в Битрикс не удалась.
 async function logProductInterestToDeal({ chatId, db, username, search_query, summary }) {
   if (!db || !chatId) return;
   try {
-    let active = await db.collection('activeBookingByChat').findOne({ chatId });
-    if (!active?.dealId) {
+    let dealId = await getActiveDealIfOpen({ db, chatId, collection: INTEREST_DEAL_COLLECTION });
+    if (!dealId) {
       const contactId = await ensureContact({ db, chatId, username }).catch(err => {
         console.error('Не удалось найти/создать карточку клиента для сделки интереса к товару:', err.message);
         return null;
       });
-      const dealId = await createInterestDeal({ chatId, username, contactId });
-      await db.collection('activeBookingByChat').updateOne(
-        { chatId },
-        { $set: { chatId, dealId } },
-        { upsert: true },
-      );
-      active = { chatId, dealId };
+      dealId = await createInterestDeal({ chatId, username, contactId });
+      await setActiveDeal({ db, chatId, dealId, collection: INTEREST_DEAL_COLLECTION });
     }
-    await addDealComment(active.dealId, `🔎 Клиент спросил ИИ про товар: "${search_query}"\n${summary}`);
+    await addDealComment(dealId, `🔎 Клиент спросил ИИ про товар: "${search_query}"\n${summary}`);
   } catch (err) {
     console.error('Не удалось залогировать интерес к товару в сделку:', err.message);
   }
