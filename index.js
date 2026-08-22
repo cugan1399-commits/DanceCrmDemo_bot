@@ -134,23 +134,63 @@ function formatRecentHistory(messages) {
     .join('\n');
 }
 
+// Есть ли у чата ещё "живая" (не закрытая) сделка — та же activeBookingByChat, что
+// используется для записи на встречу и интереса к товару (см. /api/book, ai.js).
+// deal.CLOSED — стандартное поле Битрикса, само становится 'Y' на финальных стадиях
+// воронки (успех/отказ), независимо от того, какие конкретно ID стадий вы завели —
+// поэтому не завязываемся на конкретные STAGE_* константы из .env.
+async function getActiveDealIfOpen(chatId) {
+  if (!db) return null;
+  const active = await db.collection('activeBookingByChat').findOne({ chatId });
+  if (!active?.dealId) return null;
+  try {
+    const deal = await getDeal(active.dealId);
+    if (deal?.CLOSED === 'Y') return null; // сделка завершена — для эскалации её как "активную" не считаем
+    return active.dealId;
+  } catch (err) {
+    // сделку не нашли (удалили руками при тестах и т.п.) — считаем, что активной нет
+    console.warn(`⚠️  Не удалось проверить статус сделки #${active.dealId} для chatId ${chatId}, считаю её неактивной:`, err.message);
+    return null;
+  }
+}
+
 // Общая точка выключения ИИ + уведомления менеджера — вызывается и из стоп-слов,
 // и из ответа модели (escalate_to_human), поэтому вынесена отдельно.
+//
+// Если у клиента уже есть НЕЗАКРЫТАЯ сделка (неважно, встреча это или интерес к
+// товару) — эскалация просто логируется комментарием в неё, вторая сделка не
+// создаётся. Если активной сделки нет (первое обращение) или прошлая уже завершена
+// (клиент написал спустя время после закрытой сделки) — создаётся новая, и она же
+// становится новой "активной" сделкой чата (как и с интересом к товару — см. ai.js).
 async function escalateToHuman(chatId, reason, username) {
   await setAiActive(chatId, false);
   try {
-    const contactId = await ensureContact({ db, chatId, username }).catch(err => {
-      console.error('Не удалось найти/создать карточку клиента для эскалации:', err.message);
-      return null;
-    });
     const history = await loadHistory(db, chatId);
-    const dealId = await notifyManagerAboutEscalation({
-      chatId,
-      reason,
-      recentHistoryText: formatRecentHistory(history),
-      contactId,
-    });
-    console.log(`📋 Создана сделка-эскалация #${dealId} для chatId ${chatId} (${reason})`);
+    const recentHistoryText = formatRecentHistory(history);
+    const existingDealId = await getActiveDealIfOpen(chatId);
+
+    if (existingDealId) {
+      await addDealComment(existingDealId, [
+        '⚠️ ИИ передал чат менеджеру',
+        `Причина: ${reason || 'не указана'}`,
+        recentHistoryText ? `\nПоследние сообщения:\n${recentHistoryText}` : null,
+      ].filter(Boolean).join('\n'));
+      console.log(`📋 Эскалация записана в существующую сделку #${existingDealId} для chatId ${chatId} (${reason})`);
+    } else {
+      const contactId = await ensureContact({ db, chatId, username }).catch(err => {
+        console.error('Не удалось найти/создать карточку клиента для эскалации:', err.message);
+        return null;
+      });
+      const dealId = await notifyManagerAboutEscalation({ chatId, reason, recentHistoryText, contactId });
+      if (db) {
+        await db.collection('activeBookingByChat').updateOne(
+          { chatId },
+          { $set: { chatId, dealId } },
+          { upsert: true },
+        );
+      }
+      console.log(`📋 Создана новая сделка-эскалация #${dealId} для chatId ${chatId} (${reason})`);
+    }
   } catch (err) {
     console.error('Не удалось уведомить менеджера в Битриксе:', err.message);
   }
