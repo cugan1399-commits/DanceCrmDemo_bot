@@ -112,6 +112,15 @@ async function connectDB() {
   await db.collection('aiConversations').createIndex({ chatId: 1 }, { unique: true });
   // Кеш "chatId -> ID карточки клиента (Contact) в Битриксе" — см. contacts.js.
   await db.collection('contactByChat').createIndex({ chatId: 1 }, { unique: true });
+  // ФИКС "дублирующиеся ответы бота": Telegram повторно шлёт тот же update, если
+  // вебхук не ответил 200 достаточно быстро (например, сервер только проснулся
+  // после сна на бесплатном Render-инстансе, и обработка ИИ+Bitrix заняла слишком
+  // много времени). См. app.post(TELEGRAM_WEBHOOK_PATH) ниже — там теперь 200
+  // отдаётся сразу, а сюда пишется updateId для дедупликации ДАЖЕ таких легитимных
+  // повторов. expireAfterSeconds — запись живёт 10 минут, дольше Telegram повторы
+  // всё равно не присылает, и коллекция не растёт бесконечно.
+  await db.collection('processedUpdates').createIndex({ updateId: 1 }, { unique: true });
+  await db.collection('processedUpdates').createIndex({ createdAt: 1 }, { expireAfterSeconds: 600 });
   console.log('✅ MongoDB подключена');
 }
 connectDB().catch(err => console.error('❌ Ошибка MongoDB:', err));
@@ -822,12 +831,30 @@ async function handleAiText(chatId, text, username) {
   }
 }
 
+// ФИКС "дубли сообщений от бота": раньше res.sendStatus(200) отправлялся ТОЛЬКО
+// после await всей обработки (модель + Bitrix), поэтому при медленном ответе
+// (холодный старт, заминка ИИ) Telegram решал, что вебхук не сработал, и слал тот
+// же update повторно — бот отвечал дважды на одно сообщение. Теперь: 1) сразу
+// отвечаем 200, чтобы Telegram точно не ретраил по таймауту; 2) обработку уводим
+// в фон; 3) на случай, если Telegram всё равно продублирует update по своим
+// причинам, отбрасываем повтор по update.update_id (см. processedUpdates выше).
 app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
   const update = req.body;
+  res.sendStatus(200);
+
   try {
+    if (update.update_id !== undefined && db) {
+      try {
+        await db.collection('processedUpdates').insertOne({ updateId: update.update_id, createdAt: new Date() });
+      } catch (err) {
+        if (err.code === 11000) return; // уже обработали этот update — выходим молча
+        console.error('Не удалось записать updateId для дедупликации (обрабатываю как обычно):', err.message);
+      }
+    }
+
     if (update.callback_query) {
       await handleReminderCallback(update.callback_query);
-      return res.sendStatus(200);
+      return;
     }
     const text = update.message?.text;
     const chatId = update.message?.chat?.id;
@@ -843,7 +870,6 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
   } catch (err) {
     console.error('Ошибка Telegram webhook:', err);
   }
-  res.sendStatus(200);
 });
 
 // ===================== Ручное включение ИИ менеджером =====================
