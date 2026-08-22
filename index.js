@@ -156,33 +156,56 @@ function formatRecentHistory(messages) {
 // создаётся новая. ВАЖНО: это отдельный от встречи и от интереса к товару кеш —
 // эскалация никогда не цепляется за сделку встречи/покупки, только за свою же
 // предыдущую эскалацию, если та ещё не закрыта.
+//
+// ФИКС "у одного клиента расползается 2-3 карточки (встреча/интерес/эскалация)":
+// раньше эскалация ВСЕГДА заводила свою отдельную сделку (или дописывала в
+// предыдущую такую же). Теперь порядок другой: если у чата уже есть открытая
+// сделка ЛЮБОГО типа (встреча или интерес к товару) — используем именно её,
+// просто переводим в стадию "Требуется вмешательство менеджера" и комментируем.
+// Отдельная сделка-эскалация заводится только тогда, когда у клиента вообще
+// ничего ещё не было (например, он сразу с порога попросил менеджера) — тогда
+// показать менеджеру и правда больше нечего, кроме этой карточки.
 async function escalateToHuman(chatId, reason, username) {
   await setAiActive(chatId, false);
   try {
     const history = await loadHistory(db, chatId);
     const recentHistoryText = formatRecentHistory(history);
-    const existingDealId = await getActiveDealIfOpen({ db, chatId, collection: ESCALATION_DEAL_COLLECTION });
+    const commentText = [
+      '⚠️ ИИ передал чат менеджеру',
+      `Причина: ${reason || 'не указана'}`,
+      recentHistoryText ? `\nПоследние сообщения:\n${recentHistoryText}` : null,
+    ].filter(Boolean).join('\n');
 
-    if (existingDealId) {
-      await addDealComment(existingDealId, [
-        '⚠️ ИИ передал чат менеджеру',
-        `Причина: ${reason || 'не указана'}`,
-        recentHistoryText ? `\nПоследние сообщения:\n${recentHistoryText}` : null,
-      ].filter(Boolean).join('\n'));
+    // 1) Эту же самую эскалацию этого чата уже поднимали раньше — просто дописываем.
+    let dealId = await getActiveDealIfOpen({ db, chatId, collection: ESCALATION_DEAL_COLLECTION });
+
+    // 2) Эскалации своей ещё не было, но есть открытая карточка встречи или интереса —
+    // переиспользуем её вместо того, чтобы плодить третью.
+    if (!dealId) {
+      dealId = await getActiveDealIfOpen({ db, chatId, collection: 'activeBookingByChat' })
+        || await getActiveDealIfOpen({ db, chatId, collection: 'activeInterestDealByChat' });
+    }
+
+    if (dealId) {
+      await addDealComment(dealId, commentText);
       // Возвращаем сделку в стадию "Требуется вмешательство менеджера" — если
-      // менеджер уже успел подвинуть её дальше по воронке, а клиент написал ИИ
-      // ещё раз (и снова потребовалась эскалация), новая порция внимания не
-      // должна затеряться в уже "обработанной" колонке.
-      await moveDealToEscalationStage(existingDealId).catch(err => {
-        console.error(`Не удалось вернуть сделку #${existingDealId} в стадию эскалации:`, err.message);
+      // менеджер уже успел подвинуть её дальше по воронке (или это была карточка
+      // встречи/интереса на своей стадии), новая порция внимания не должна
+      // затеряться в уже "обработанной" колонке.
+      await moveDealToEscalationStage(dealId).catch(err => {
+        console.error(`Не удалось перевести сделку #${dealId} в стадию эскалации:`, err.message);
       });
-      console.log(`📋 Эскалация записана в существующую сделку #${existingDealId} для chatId ${chatId} (${reason})`);
+      // Запоминаем именно эту сделку как "активную эскалацию" чата — при следующей
+      // эскалации (см. п.1) найдём её сразу, не будем искать по другим коллекциям.
+      await setActiveDeal({ db, chatId, dealId, collection: ESCALATION_DEAL_COLLECTION });
+      console.log(`📋 Эскалация записана в существующую карточку #${dealId} для chatId ${chatId} (${reason})`);
     } else {
+      // 3) У клиента вообще нет ни одной открытой карточки — заводим новую.
       const contactId = await ensureContact({ db, chatId, username }).catch(err => {
         console.error('Не удалось найти/создать карточку клиента для эскалации:', err.message);
         return null;
       });
-      const dealId = await notifyManagerAboutEscalation({ chatId, reason, recentHistoryText, contactId });
+      dealId = await notifyManagerAboutEscalation({ chatId, reason, recentHistoryText, contactId });
       await setActiveDeal({ db, chatId, dealId, collection: ESCALATION_DEAL_COLLECTION });
       console.log(`📋 Создана новая сделка-эскалация #${dealId} для chatId ${chatId} (${reason})`);
     }
