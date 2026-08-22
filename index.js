@@ -192,6 +192,26 @@ function sendMessage(chatId, text, keyboard) {
   return axios.post(`${API}/sendMessage`, data);
 }
 
+// Отправка фото товара (см. send_product_photo в ai.js). Мы САМИ скачиваем файл с
+// Битрикса и заливаем байты в Telegram (multipart), а не отдаём Telegram ссылку на
+// скачивание "как есть" — потому что в этой ссылке зашит токен нашего входящего
+// вебхука Битрикса, светить его перед серверами Telegram не хочется, плюс так
+// надёжнее (Telegram не всегда может дотянуться до "внутренних" REST-эндпоинтов CRM).
+// Требует Node 18+ (глобальные fetch/FormData/Blob) — на Render это по умолчанию так.
+async function sendPhotoFromUrl(chatId, photoUrl, caption) {
+  const { data: imageBuffer } = await axios.get(photoUrl, { responseType: 'arraybuffer' });
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (caption) form.append('caption', caption);
+  form.append('photo', new Blob([imageBuffer]), 'product.jpg');
+  const res = await fetch(`${API}/sendPhoto`, { method: 'POST', body: form });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Telegram sendPhoto: HTTP ${res.status} — ${body}`);
+  }
+  return res.json();
+}
+
 function answerCallback(callbackQueryId, text = '') {
   return axios.post(`${API}/answerCallbackQuery`, { callback_query_id: callbackQueryId, text });
 }
@@ -756,7 +776,12 @@ async function handleAiText(chatId, text, username) {
   if (!active) return; // менеджер уже ведёт чат руками — ИИ молчит
 
   try {
-    const { replyText, escalate, escalateReason } = await handleUserMessage({ db, chatId, userText: text, username });
+    const { replyText, escalate, escalateReason, photoUrl } = await handleUserMessage({ db, chatId, userText: text, username });
+    if (photoUrl) {
+      await sendPhotoFromUrl(chatId, photoUrl).catch(err => {
+        console.error('Не удалось отправить фото товара в Telegram:', err.message);
+      });
+    }
     if (replyText) await sendMessage(chatId, replyText);
     if (escalate) await escalateToHuman(chatId, escalateReason, username);
   } catch (err) {

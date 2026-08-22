@@ -25,7 +25,7 @@
 //   AI_MAX_HISTORY_MESSAGES — сколько последних сообщений диалога держим в контексте (по умолчанию 16)
 
 import axios from 'axios';
-import { bitrixCall, getDeal, addDealComment, createInterestDeal, createOrderDeal, ORG_TIMEZONE } from './bitrix.js';
+import { bitrixCall, getDeal, addDealComment, createInterestDeal, createOrderDeal, getProductPhotoUrl, ORG_TIMEZONE } from './bitrix.js';
 import { ensureContact, getActiveDealIfOpen, setActiveDeal } from './contacts.js';
 
 // Отдельный от встречи (activeBookingByChat в index.js) кеш "активной сделки" —
@@ -125,6 +125,21 @@ export const AI_TOOLS = [
       description:
         'Проверить статус текущей заявки/встречи ЭТОГО клиента (по его chatId) — используй, когда клиент спрашивает о судьбе своей записи/заказа/встречи.',
       parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'send_product_photo',
+      description:
+        'Отправить клиенту в Telegram настоящее фото товара из каталога Битрикс24. Вызывай, когда клиент просит показать/прислать фото, картинку, "как выглядит" какого-то товара. Это НЕ ответ текстом — фото уйдёт отдельным сообщением автоматически, тебе не нужно ничего вставлять в текст самому.',
+      parameters: {
+        type: 'object',
+        properties: {
+          product_name: { type: 'string', description: 'Название товара, чьё фото нужно отправить (как оно фигурирует в каталоге/переписке)' },
+        },
+        required: ['product_name'],
+      },
     },
   },
   {
@@ -255,6 +270,34 @@ async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
   }
 }
 
+// ФИКС "на просьбу прислать фото бот зовёт менеджера": раньше у ИИ вообще не было
+// инструмента для этого, и просьба "покажи фото" попадала под общее описание
+// escalate_to_human ("вопрос вне твоей компетенции"). Сам факт отправки файла в
+// Telegram делает index.js (там же лежит BOT_TOKEN/API, а сюда его тащить не стоит,
+// чтобы не плодить циклическую зависимость) — поэтому здесь так же, как и с
+// escalate_to_human, возвращаем служебный маркер с URL фото, а handleUserMessage
+// ниже вычленяет его из ответа инструмента и кладёт в photoUrl итогового результата.
+async function toolSendProductPhoto({ search_query, product_name, chatId, db, username }) {
+  const query = product_name || search_query;
+  try {
+    const iblockId = await resolveCatalogIblockId();
+    const products = await bitrixCall('catalog.product.list', {
+      select: ['id', 'iblockId', 'name'],
+      filter: { iblockId, '%name': query },
+    });
+    const list = products?.products || products || [];
+    if (!list.length) return `Товар "${query}" не найден в каталоге, фото отправить нечего.`;
+
+    const photoUrl = await getProductPhotoUrl(list[0].id);
+    if (!photoUrl) return `У товара "${list[0].name}" в каталоге нет загруженного фото.`;
+
+    return `[[SEND_PHOTO:${photoUrl}]] Фото товара "${list[0].name}" отправлено клиенту отдельным сообщением.`;
+  } catch (err) {
+    console.error('Инструмент send_product_photo упал:', err.message);
+    return 'Не удалось получить фото товара из Битрикса (техническая ошибка).';
+  }
+}
+
 async function toolCheckMyDealStatus({ chatId, db }) {
   if (!db) return 'Локальная база недоступна, не могу найти сделку клиента.';
   try {
@@ -315,6 +358,7 @@ async function toolEscalateToHuman({ reason }) {
 const TOOL_HANDLERS = {
   check_product_catalog: toolCheckProductCatalog,
   check_my_deal_status: toolCheckMyDealStatus,
+  send_product_photo: toolSendProductPhoto,
   create_order: toolCreateOrder,
   escalate_to_human: toolEscalateToHuman,
 };
@@ -366,6 +410,7 @@ const SYSTEM_PROMPT = `Ты — вежливый консультант комп
 Ты умеешь:
 — отвечать на вопросы о товарах/услугах и ценах (используй check_product_catalog) — вызывай его при ЛЮБОМ упоминании товара клиентом, даже если он не спросил явно цену/наличие (например "мне нужны кроссовки" — это тоже повод вызвать check_product_catalog, а не отвечать по памяти);
 — проверять статус заявки/встречи текущего клиента (используй check_my_deal_status, chatId клиента передавать не нужно — это делается автоматически);
+— отправлять фото товара клиенту (используй send_product_photo), если он просит показать/прислать фото или картинку товара — это НЕ повод звать менеджера, ты можешь сделать это сам;
 — оформлять заказ (используй create_order), но ТОЛЬКО после того, как по очереди уточнишь у клиента: 1) какой именно товар (сверь через check_product_catalog), 2) размер, 3) цвет, 4) адрес доставки, 5) способ оплаты. Спрашивай недостающее по одному пункту за раз, не вываливай все вопросы сразу. Пока не собраны все пять пунктов — НЕ вызывай create_order и НЕ говори клиенту, что заказ оформлен, принят или уже готовится: это будет ложью, пока сделка реально не создана инструментом;
 — передавать диалог человеку (используй escalate_to_human), если клиент просит оператора/менеджера/человека, либо если вопрос вне твоей компетенции (жалобы, нестандартные просьбы, ты не уверен в ответе).
 Не выдумывай цены, наличие, цвета и размеры — только по данным из check_product_catalog и из того, что явно сказал клиент. Если инструмент не нашёл товар — так и скажи, не придумывай.`;
@@ -385,6 +430,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
 
   let escalate = false;
   let escalateReason = null;
+  let photoUrl = null;
 
   // Цикл на случай нескольких последовательных вызовов инструментов подряд
   // (модель вызвала функцию -> получила результат -> решила вызвать ещё одну).
@@ -396,7 +442,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
     if (!toolCalls || toolCalls.length === 0) {
       // Обычный текстовый ответ — финал.
       await saveHistory(db, chatId, [...history, { role: 'user', content: userText }, assistantMsg]);
-      return { replyText: assistantMsg.content || null, escalate, escalateReason };
+      return { replyText: assistantMsg.content || null, escalate, escalateReason, photoUrl };
     }
 
     for (const call of toolCalls) {
@@ -416,13 +462,17 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
         escalate = true;
         escalateReason = escMatch[1];
       }
+      const photoMatch = /\[\[SEND_PHOTO:(.*?)\]\]/.exec(resultText);
+      if (photoMatch) {
+        photoUrl = photoMatch[1];
+      }
 
       messages.push({ role: 'tool', tool_call_id: call.id, content: resultText });
     }
   }
 
   // Не уложились в лимит шагов — на всякий случай отдаём то, что накопилось, как эскалацию
-  return { replyText: 'Секунду, уточню у менеджера и вернусь с ответом.', escalate: true, escalateReason: escalateReason || 'много шагов ИИ без финального ответа' };
+  return { replyText: 'Секунду, уточню у менеджера и вернусь с ответом.', escalate: true, escalateReason: escalateReason || 'много шагов ИИ без финального ответа', photoUrl };
 }
 
 // ---------- Стоп-слова (быстрый путь, без обращения к модели) ----------

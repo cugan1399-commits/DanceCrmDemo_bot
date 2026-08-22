@@ -250,6 +250,26 @@ export async function createOrderDeal({ chatId, username, contactId, productName
   return bitrixCall('crm.deal.add', { fields });
 }
 
+// Достаёт РЕАЛЬНОЕ фото товара из коммерческого каталога (а не то, что ИИ мог бы
+// найти в интернете и случайно перепутать модель). catalog.product.get возвращает
+// detailPicture/previewPicture как объект { id, url, urlMachine }, где url — ОТНОСИТЕЛЬНЫЙ
+// путь вида "/rest/catalog.product.download?fields[fieldName]=...&fields[fileId]=...".
+// Он не абсолютный и не содержит токен вебхука — достраиваем его сами, подставляя
+// тот же хост+токен, что уже используется во всех остальных вызовах (BITRIX_WEBHOOK_URL).
+export async function getProductPhotoUrl(productId) {
+  const raw = await bitrixCall('catalog.product.get', {
+    id: productId,
+    select: ['id', 'previewPicture', 'detailPicture'],
+  });
+  const product = raw?.product || raw;
+  const picture = product?.detailPicture || product?.previewPicture;
+  if (!picture?.url) return null;
+
+  const queryIndex = picture.url.indexOf('?');
+  const query = queryIndex >= 0 ? picture.url.slice(queryIndex) : '';
+  return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+}
+
 // ---------- Ответ менеджера прямо из поля сделки ----------
 
 // Находит сделки, где поле "Ответ клиенту в Телеграм" заполнено (менеджер только
