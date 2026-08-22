@@ -317,7 +317,7 @@ async function findProductOrOfferPicture(productId) {
   try {
     const offersRaw = await bitrixCall('catalog.product.offer.list', {
       filter: { parentId: productId },
-      select: ['id', 'previewPicture', 'detailPicture'],
+      select: ['id', 'iblockId', 'previewPicture', 'detailPicture'],
     });
     const offers = offersRaw?.offers || offersRaw || [];
     for (const offer of offers) {
