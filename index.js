@@ -30,6 +30,7 @@ import {
   ORG_TIMEZONE,
 } from './bitrix.js';
 import { handleUserMessage, isStopWordTrigger, loadHistory } from './ai.js';
+import { ensureContact } from './contacts.js';
 import {
   zonedTimeToUTC,
   hhmmInTZ,
@@ -97,6 +98,8 @@ async function connectDB() {
   await db.collection('aiChatStatus').createIndex({ chatId: 1 }, { unique: true });
   // История диалога с ИИ по чату (для контекста между сообщениями) — см. ai.js.
   await db.collection('aiConversations').createIndex({ chatId: 1 }, { unique: true });
+  // Кеш "chatId -> ID карточки клиента (Contact) в Битриксе" — см. contacts.js.
+  await db.collection('contactByChat').createIndex({ chatId: 1 }, { unique: true });
   console.log('✅ MongoDB подключена');
 }
 connectDB().catch(err => console.error('❌ Ошибка MongoDB:', err));
@@ -133,14 +136,19 @@ function formatRecentHistory(messages) {
 
 // Общая точка выключения ИИ + уведомления менеджера — вызывается и из стоп-слов,
 // и из ответа модели (escalate_to_human), поэтому вынесена отдельно.
-async function escalateToHuman(chatId, reason) {
+async function escalateToHuman(chatId, reason, username) {
   await setAiActive(chatId, false);
   try {
+    const contactId = await ensureContact({ db, chatId, username }).catch(err => {
+      console.error('Не удалось найти/создать карточку клиента для эскалации:', err.message);
+      return null;
+    });
     const history = await loadHistory(db, chatId);
     const dealId = await notifyManagerAboutEscalation({
       chatId,
       reason,
       recentHistoryText: formatRecentHistory(history),
+      contactId,
     });
     console.log(`📋 Создана сделка-эскалация #${dealId} для chatId ${chatId} (${reason})`);
   } catch (err) {
@@ -289,7 +297,16 @@ app.post('/api/book', async (req, res) => {
       return res.status(409).json({ error: 'slot_taken' });
     }
 
+    // Одна карточка клиента на chatId, независимо от того, обращался ли он раньше
+    // через ИИ-консультанта (см. logProductInterestToDeal в ai.js) или впервые
+    // пришёл сразу записываться — вторая ветка тоже даёт этому же контакту имя/телефон.
+    const contactId = await ensureContact({ db, chatId: user.id, username: user.username, name, phone }).catch(err => {
+      console.error('Не удалось найти/создать карточку клиента для записи на встречу:', err.message);
+      return null;
+    });
+
     const dealInput = {
+      contactId,
       name, phone, topic, fromDate, toDate,
       chatId: user.id, username: user.username,
     };
@@ -652,7 +669,7 @@ async function handleReminderCallback(cq) {
 async function handleAiText(chatId, text, username) {
   // Быстрый путь: стоп-слова клиента распознаём без обращения к модели.
   if (isStopWordTrigger(text)) {
-    await escalateToHuman(chatId, 'клиент написал стоп-слово ("оператор"/"менеджер"/"человек")');
+    await escalateToHuman(chatId, 'клиент написал стоп-слово ("оператор"/"менеджер"/"человек")', username);
     return;
   }
 
@@ -662,11 +679,11 @@ async function handleAiText(chatId, text, username) {
   try {
     const { replyText, escalate, escalateReason } = await handleUserMessage({ db, chatId, userText: text, username });
     if (replyText) await sendMessage(chatId, replyText);
-    if (escalate) await escalateToHuman(chatId, escalateReason);
+    if (escalate) await escalateToHuman(chatId, escalateReason, username);
   } catch (err) {
     console.error('Ошибка ИИ-консультанта:', err.message);
     await sendMessage(chatId, 'Извините, техническая заминка. Уже зову менеджера.').catch(() => {});
-    await escalateToHuman(chatId, 'техническая ошибка при обращении к ИИ');
+    await escalateToHuman(chatId, 'техническая ошибка при обращении к ИИ', username);
   }
 }
 

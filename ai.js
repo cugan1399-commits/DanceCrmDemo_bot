@@ -26,6 +26,7 @@
 
 import axios from 'axios';
 import { bitrixCall, getDeal, addDealComment, createInterestDeal, ORG_TIMEZONE } from './bitrix.js';
+import { ensureContact } from './contacts.js';
 
 const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 const AI_API_KEY = process.env.AI_API_KEY;
@@ -185,7 +186,11 @@ async function logProductInterestToDeal({ chatId, db, username, search_query, su
   try {
     let active = await db.collection('activeBookingByChat').findOne({ chatId });
     if (!active?.dealId) {
-      const dealId = await createInterestDeal({ chatId, username });
+      const contactId = await ensureContact({ db, chatId, username }).catch(err => {
+        console.error('Не удалось найти/создать карточку клиента для сделки интереса к товару:', err.message);
+        return null;
+      });
+      const dealId = await createInterestDeal({ chatId, username, contactId });
       await db.collection('activeBookingByChat').updateOne(
         { chatId },
         { $set: { chatId, dealId } },

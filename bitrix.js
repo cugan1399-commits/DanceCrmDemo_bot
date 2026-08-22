@@ -18,6 +18,12 @@ const BITRIX_TG_FIELD_NAME = process.env.BITRIX_TG_FIELD_NAME; // напр. UF_C
 // шлёт клиенту в Telegram. Код поля НЕ совпадает с тем, что написано на форме —
 // его нужно посмотреть в ответе crm.deal.fields.json (см. .env.example).
 const BITRIX_MANAGER_REPLY_FIELD_NAME = process.env.BITRIX_MANAGER_REPLY_FIELD_NAME;
+// Поле НА КОНТАКТЕ (не на сделке!) для Telegram chatId — по нему находим/создаём
+// единую "карточку клиента", к которой привязываются ВСЕ его сделки (запись на
+// встречу, интерес к товару, эскалация к менеджеру). Код поля свой для контактов,
+// он НЕ совпадает с BITRIX_TG_FIELD_NAME сделки, даже если подписи одинаковые —
+// смотреть в crm.contact.fields.json, а не в crm.deal.fields.json.
+const BITRIX_CONTACT_TG_FIELD_NAME = process.env.BITRIX_CONTACT_TG_FIELD_NAME;
 const ORG_TIMEZONE = process.env.ORG_TIMEZONE || 'Europe/Minsk';
 
 if (!BITRIX_WEBHOOK_URL) {
@@ -28,6 +34,9 @@ if (!BITRIX_TG_FIELD_NAME) {
 }
 if (!BITRIX_MANAGER_REPLY_FIELD_NAME) {
   console.warn('⚠️  BITRIX_MANAGER_REPLY_FIELD_NAME не задан в .env — ответы менеджера из поля сделки подхватываться не будут');
+}
+if (!BITRIX_CONTACT_TG_FIELD_NAME) {
+  console.warn('⚠️  BITRIX_CONTACT_TG_FIELD_NAME не задан в .env — карточки клиента (контакты) создаваться не будут, все сделки останутся без CONTACT_ID');
 }
 
 function methodUrl(method) {
@@ -117,7 +126,7 @@ function humanTime(date) {
 
 // Время теперь ВСЕГДА в заголовке сделки — раньше его там не было, и все отменённые
 // клиентом заявки в CRM выглядели одинаково и неотличимо друг от друга.
-function dealFields({ name, phone, topic, fromDate, toDate, chatId, username }) {
+function dealFields({ name, phone, topic, fromDate, toDate, chatId, username, contactId }) {
   const fields = {
     TITLE: `Встреча ${humanTime(fromDate)} — ${name}`,
     BEGINDATE: toBitrixISO(fromDate, ORG_TIMEZONE),
@@ -129,6 +138,10 @@ function dealFields({ name, phone, topic, fromDate, toDate, chatId, username }) 
     ].filter(Boolean).join('\n'),
   };
   if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
+  // Привязка к карточке клиента (см. ensureContact в contacts.js) — благодаря ей
+  // в Битриксе видно, что "Встреча ..." и, например, "Интерес к товару ..." —
+  // сделки ОДНОГО И ТОГО ЖЕ человека, а не два несвязанных обращения.
+  if (contactId) fields.CONTACT_ID = contactId;
   return fields;
 }
 
@@ -167,7 +180,7 @@ const BITRIX_MANAGER_USER_ID = process.env.BITRIX_MANAGER_USER_ID;
 // метод, что уже используется для записи на встречу, то есть права точно есть.
 // Это заодно даёт менеджеру ровно то, что нужно: карточку в CRM с историей диалога
 // и Telegram ID клиента, откуда удобно продолжать общение.
-export async function notifyManagerAboutEscalation({ chatId, reason, recentHistoryText }) {
+export async function notifyManagerAboutEscalation({ chatId, reason, recentHistoryText, contactId }) {
   const fields = {
     TITLE: `⚠️ ИИ передал чат менеджеру (chatId ${chatId})`,
     COMMENTS: [
@@ -178,6 +191,7 @@ export async function notifyManagerAboutEscalation({ chatId, reason, recentHisto
   };
   if (BITRIX_MANAGER_USER_ID) fields.ASSIGNED_BY_ID = BITRIX_MANAGER_USER_ID;
   if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
+  if (contactId) fields.CONTACT_ID = contactId;
 
   return bitrixCall('crm.deal.add', { fields });
 }
@@ -201,12 +215,13 @@ export async function addDealComment(dealId, text) {
 // бронирование, а просто карточка для менеджера, которая позже может либо
 // превратиться в сделку встречи (если клиент запишется — см. /api/book), либо
 // остаться как есть, если он просто спрашивал.
-export async function createInterestDeal({ chatId, username }) {
+export async function createInterestDeal({ chatId, username, contactId }) {
   const fields = {
     TITLE: `Интерес к товару — ${username ? '@' + username : `Telegram ${chatId}`}`,
     COMMENTS: username ? `Telegram: @${username}` : `Telegram chatId: ${chatId}`,
   };
   if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
+  if (contactId) fields.CONTACT_ID = contactId;
   return bitrixCall('crm.deal.add', { fields });
 }
 
@@ -238,9 +253,51 @@ export async function clearManagerReplyField(dealId) {
   });
 }
 
+// ---------- CRM: карточка клиента (Contact) ----------
+//
+// Один Telegram-пользователь = один Contact в Битриксе, независимо от того, с чего
+// он начал (запись на встречу или вопрос ИИ про товар). Сами сделки (Deal) как
+// создавались отдельно под каждый сценарий, так и создаются — но теперь у каждой
+// проставляется CONTACT_ID на этот Contact (см. dealFields/createInterestDeal/
+// notifyManagerAboutEscalation выше), и в Битриксе видно ИСТОРИЮ клиента целиком,
+// а не набор внешне не связанных карточек. Локальное кеширование chatId->contactId
+// (таблица contactByChat) и решение "создавать или переиспользовать" — в contacts.js,
+// здесь только сырые REST-вызовы.
+
+export async function findContactByChatId(chatId) {
+  if (!BITRIX_CONTACT_TG_FIELD_NAME) return null;
+  const result = await bitrixCall('crm.contact.list', {
+    filter: { [BITRIX_CONTACT_TG_FIELD_NAME]: String(chatId) },
+    select: ['ID'],
+  });
+  return result && result[0] ? result[0].ID : null;
+}
+
+export async function createContact({ chatId, username, name, phone }) {
+  const fields = {
+    NAME: name || (username ? `@${username}` : `Telegram ${chatId}`),
+  };
+  if (phone) fields.PHONE = [{ VALUE: phone, VALUE_TYPE: 'WORK' }];
+  if (username) fields.WEB = [{ VALUE: `https://t.me/${username}`, VALUE_TYPE: 'WORK' }];
+  if (BITRIX_CONTACT_TG_FIELD_NAME) fields[BITRIX_CONTACT_TG_FIELD_NAME] = String(chatId);
+  return bitrixCall('crm.contact.add', { fields });
+}
+
+// Дозаполняем карточку, когда узнаём то, чего раньше не знали (например, клиент
+// сначала просто спрашивал про товар без имени/телефона, а потом записался на
+// встречу и указал их) — контакт при этом остаётся тем же самым, не плодим новый.
+export async function updateContact(contactId, { name, phone }) {
+  const fields = {};
+  if (name) fields.NAME = name;
+  if (phone) fields.PHONE = [{ VALUE: phone, VALUE_TYPE: 'WORK' }];
+  if (!Object.keys(fields).length) return;
+  return bitrixCall('crm.contact.update', { id: contactId, fields });
+}
+
 export {
   BITRIX_TG_FIELD_NAME,
   BITRIX_MANAGER_REPLY_FIELD_NAME,
+  BITRIX_CONTACT_TG_FIELD_NAME,
   BITRIX_CALENDAR_ID,
   BITRIX_CALENDAR_TYPE,
   ORG_TIMEZONE,
