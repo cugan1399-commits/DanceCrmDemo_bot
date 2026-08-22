@@ -26,6 +26,14 @@ const BITRIX_MANAGER_REPLY_FIELD_NAME = process.env.BITRIX_MANAGER_REPLY_FIELD_N
 const BITRIX_CONTACT_TG_FIELD_NAME = process.env.BITRIX_CONTACT_TG_FIELD_NAME;
 const ORG_TIMEZONE = process.env.ORG_TIMEZONE || 'Europe/Minsk';
 
+// Стадии для сделок ИИ-консультанта (отдельная воронка от встречи — см. dealFields
+// выше, там своя логика через BITRIX_*_STAGE_ID). Значения по умолчанию — это
+// реальные STATUS_ID из воронки заказчика (см. crm.status.list), но можно
+// переопределить через .env, если стадии переименуют/пересоздадут.
+const BITRIX_ESCALATION_STAGE_ID = process.env.BITRIX_ESCALATION_STAGE_ID || 'UC_TIVP3I'; // "Требуется вмешательство менеджера"
+const BITRIX_ORDER_PAID_ONLINE_STAGE_ID = process.env.BITRIX_ORDER_PAID_ONLINE_STAGE_ID || 'UC_W8J1FY'; // "Оплачено онлайн, ожидает доставку"
+const BITRIX_ORDER_COD_STAGE_ID = process.env.BITRIX_ORDER_COD_STAGE_ID || 'UC_J6MCQD'; // "Оплата курьеру при получении, ожидает доставку"
+
 if (!BITRIX_WEBHOOK_URL) {
   console.warn('⚠️  BITRIX_WEBHOOK_URL не задан в .env — обращения к Битриксу будут падать');
 }
@@ -183,6 +191,7 @@ const BITRIX_MANAGER_USER_ID = process.env.BITRIX_MANAGER_USER_ID;
 export async function notifyManagerAboutEscalation({ chatId, reason, recentHistoryText, contactId }) {
   const fields = {
     TITLE: `⚠️ ИИ передал чат менеджеру (chatId ${chatId})`,
+    STAGE_ID: BITRIX_ESCALATION_STAGE_ID,
     COMMENTS: [
       `Причина: ${reason || 'не указана'}`,
       `Telegram chatId: ${chatId}`,
@@ -194,6 +203,14 @@ export async function notifyManagerAboutEscalation({ chatId, reason, recentHisto
   if (contactId) fields.CONTACT_ID = contactId;
 
   return bitrixCall('crm.deal.add', { fields });
+}
+
+// Возвращает УЖЕ существующую (ещё не закрытую) сделку-эскалацию обратно в стадию
+// "Требуется вмешательство менеджера" — на случай, если менеджер уже успел подвинуть
+// её дальше по воронке, а клиент написал ИИ ещё раз и потребовалась новая эскалация
+// в ту же сделку (см. escalateToHuman в index.js).
+export function moveDealToEscalationStage(dealId) {
+  return updateDealStage(dealId, BITRIX_ESCALATION_STAGE_ID);
 }
 
 // ---------- Таймлайн сделки: лог того, что клиент спрашивал у ИИ ----------
@@ -233,7 +250,21 @@ export async function createInterestDeal({ chatId, username, contactId }) {
 // оплата. Каждый вызов создаёт НОВУЮ сделку (а не дописывает в старую, как это
 // сделано для интереса/эскалации) — заказ это отдельная транзакция каждый раз,
 // а не одна и та же "тема" разговора, которую можно продолжать.
+// Человекочитаемая подпись способа оплаты в COMMENTS сделки — соответствует двум
+// вариантам, которые ИИ может передать (см. create_order в ai.js: параметр
+// payment_method — строго 'online' либо 'cash_on_delivery', а не произвольный
+// текст, чтобы не гадать по ключевым словам, в какую стадию класть сделку).
+const PAYMENT_METHOD_LABELS = {
+  online: 'Оплата онлайн',
+  cash_on_delivery: 'Оплата курьеру при получении',
+};
+const STAGE_BY_PAYMENT_METHOD = {
+  online: BITRIX_ORDER_PAID_ONLINE_STAGE_ID,
+  cash_on_delivery: BITRIX_ORDER_COD_STAGE_ID,
+};
+
 export async function createOrderDeal({ chatId, username, contactId, productName, size, color, deliveryAddress, paymentMethod }) {
+  const paymentLabel = PAYMENT_METHOD_LABELS[paymentMethod] || paymentMethod;
   const fields = {
     TITLE: `Заказ: ${productName}${color ? ', ' + color : ''}${size ? ', размер ' + size : ''}`,
     COMMENTS: [
@@ -241,10 +272,12 @@ export async function createOrderDeal({ chatId, username, contactId, productName
       color ? `Цвет: ${color}` : null,
       size ? `Размер: ${size}` : null,
       `Адрес доставки: ${deliveryAddress}`,
-      `Способ оплаты: ${paymentMethod}`,
+      `Способ оплаты: ${paymentLabel}`,
       username ? `Telegram: @${username}` : `Telegram chatId: ${chatId}`,
     ].filter(Boolean).join('\n'),
   };
+  const stageId = STAGE_BY_PAYMENT_METHOD[paymentMethod];
+  if (stageId) fields.STAGE_ID = stageId;
   if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
   if (contactId) fields.CONTACT_ID = contactId;
   return bitrixCall('crm.deal.add', { fields });

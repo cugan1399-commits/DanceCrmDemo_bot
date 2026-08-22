@@ -22,6 +22,7 @@ import {
   getDeal,
   updateDealStage,
   notifyManagerAboutEscalation,
+  moveDealToEscalationStage,
   addDealComment,
   getDealsWithManagerReply,
   clearManagerReplyField,
@@ -168,6 +169,13 @@ async function escalateToHuman(chatId, reason, username) {
         `Причина: ${reason || 'не указана'}`,
         recentHistoryText ? `\nПоследние сообщения:\n${recentHistoryText}` : null,
       ].filter(Boolean).join('\n'));
+      // Возвращаем сделку в стадию "Требуется вмешательство менеджера" — если
+      // менеджер уже успел подвинуть её дальше по воронке, а клиент написал ИИ
+      // ещё раз (и снова потребовалась эскалация), новая порция внимания не
+      // должна затеряться в уже "обработанной" колонке.
+      await moveDealToEscalationStage(existingDealId).catch(err => {
+        console.error(`Не удалось вернуть сделку #${existingDealId} в стадию эскалации:`, err.message);
+      });
       console.log(`📋 Эскалация записана в существующую сделку #${existingDealId} для chatId ${chatId} (${reason})`);
     } else {
       const contactId = await ensureContact({ db, chatId, username }).catch(err => {
