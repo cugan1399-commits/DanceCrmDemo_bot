@@ -242,6 +242,24 @@ async function logProductInterestToDeal({ chatId, db, username, search_query, su
   }
 }
 
+// Запоминаем последний товар, который реально нашёлся в каталоге для этого чата —
+// нужно для детерминированной отправки фото (см. tryPhotoShortcut ниже), чтобы не
+// зависеть от того, вызовет ли модель send_product_photo сама.
+async function rememberLastProduct(db, chatId, productName) {
+  if (!db || !productName) return;
+  await db.collection('aiConversations').updateOne(
+    { chatId },
+    { $set: { lastProductName: productName } },
+    { upsert: true },
+  );
+}
+
+async function getLastProductName(db, chatId) {
+  if (!db) return null;
+  const doc = await db.collection('aiConversations').findOne({ chatId });
+  return doc?.lastProductName || null;
+}
+
 async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
   try {
     const iblockId = await resolveCatalogIblockId();
@@ -256,6 +274,7 @@ async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
       await logProductInterestToDeal({ chatId, db, username, search_query, summary: notFoundText });
       return notFoundText;
     }
+    await rememberLastProduct(db, chatId, list[0].name);
     const pricesByProductId = await fetchPricesByProductIds(list.map(p => p.id));
     const lines = list.slice(0, 8).map(p => {
       const priceEntry = pricesByProductId.get(p.id);
@@ -437,12 +456,43 @@ async function callModel(messages, attempt = 1) {
 
 const SYSTEM_PROMPT = `Ты — вежливый консультант компании в Telegram-чате. Отвечай кратко, по-русски, дружелюбно.
 Ты умеешь:
-— отвечать на вопросы о товарах/услугах и ценах (используй check_product_catalog) — вызывай его при ЛЮБОМ упоминании товара клиентом, даже если он не спросил явно цену/наличие (например "мне нужны кроссовки" — это тоже повод вызвать check_product_catalog, а не отвечать по памяти);
+— отвечать на вопросы о товарах/услугах и ценах (используй check_product_catalog) — вызывай его при ЛЮБОМ упоминании товара клиентом, даже если он не спросил явно цену/наличие (например "мне нужны кроссовки" — это тоже повод вызвать check_product_catalog, а не отвечать по памяти). НИКОГДА не упоминай модель/товар, которого не было в результатах check_product_catalog В ЭТОМ диалоге — не предлагай клиенту "другие модели" или "модели с фото", которые ты не проверял через инструмент прямо сейчас;
 — проверять статус заявки/встречи текущего клиента (используй check_my_deal_status, chatId клиента передавать не нужно — это делается автоматически);
 — отправлять фото товара клиенту (используй send_product_photo), если он просит показать/прислать фото или картинку товара — это НЕ повод звать менеджера, ты можешь сделать это сам. НИКОГДА не утверждай, что у товара "нет фото в каталоге" или наоборот "фото есть", пока реально не вызвал send_product_photo и не увидел его результат — check_product_catalog информацию о фото не возвращает, поэтому раньше вызова send_product_photo ты об этом ничего не знаешь. Если не уверен, нужно ли фото клиенту — просто предложи прислать, а не делай заявлений о его наличии;
 — оформлять заказ (используй create_order), но ТОЛЬКО после того, как по очереди уточнишь у клиента: 1) какой именно товар (сверь через check_product_catalog), 2) размер, 3) цвет, 4) адрес доставки, 5) способ оплаты — предложи клиенту выбрать РОВНО из двух вариантов: оплата онлайн заранее, или оплата курьеру при получении (это напрямую влияет на то, в какую стадию воронки попадёт сделка, поэтому не додумывай сам, если клиент ответил расплывчато — переспроси). Спрашивай недостающее по одному пункту за раз, не вываливай все вопросы сразу. Пока не собраны все пять пунктов — НЕ вызывай create_order и НЕ говори клиенту, что заказ оформлен, принят или уже готовится: это будет ложью, пока сделка реально не создана инструментом;
 — передавать диалог человеку (используй escalate_to_human), если клиент просит оператора/менеджера/человека, либо если вопрос вне твоей компетенции (жалобы, нестандартные просьбы, ты не уверен в ответе).
 Не выдумывай цены, наличие, цвета и размеры — только по данным из check_product_catalog и из того, что явно сказал клиент. Если инструмент не нашёл товар — так и скажи, не придумывай.`;
+
+// ФИКС "модель не вызывает send_product_photo сама, а сочиняет ответ про фото
+// (то 'нашёл', то 'не нашёл', иногда вообще про несуществующую модель)": для
+// дешёвой/бесплатной модели это критичное действие нельзя доверять её "решению" —
+// она ненадёжна. Поэтому запрос на фото детектируем СРАЗУ по ключевым словам (как
+// уже сделано для стоп-слов эскалации) и вызываем send_product_photo НАПРЯМУЮ, в
+// обход модели вообще — результат детерминирован независимо от того, насколько
+// хорошо конкретная модель следует промпту.
+const PHOTO_INTENT_RE = /фот|картин|покажи|как\s*выгляд|снимок/i;
+
+async function tryPhotoShortcut({ db, chatId, userText, username }) {
+  if (!PHOTO_INTENT_RE.test(userText)) return null;
+  const productName = await getLastProductName(db, chatId);
+  if (!productName) return null; // ещё не обсуждали никакой конкретный товар — пусть разбирается модель
+
+  const resultText = await toolSendProductPhoto({ product_name: productName, chatId, db, username });
+  const photoMatch = /\[\[SEND_PHOTO:(.*?)\]\]/.exec(resultText);
+  const photoUrl = photoMatch ? photoMatch[1] : null;
+  const replyText = photoUrl ? null : resultText; // если фото ушло — лишний текст не нужен
+
+  // Сохраняем в историю, чтобы у модели дальше был контекст, что фото уже прислали
+  // (или что его не нашлось) — иначе на следующий вопрос она снова будет гадать.
+  const history = await loadHistory(db, chatId);
+  await saveHistory(db, chatId, [
+    ...history,
+    { role: 'user', content: userText },
+    { role: 'assistant', content: photoUrl ? `Отправил клиенту фото товара "${productName}".` : resultText },
+  ]);
+
+  return { replyText, escalate: false, escalateReason: null, photoUrl };
+}
 
 // ---------- Публичная функция: обработать сообщение пользователя ----------
 //
@@ -450,6 +500,9 @@ const SYSTEM_PROMPT = `Ты — вежливый консультант комп
 // replyText — что отправить клиенту (может быть null, если только эскалация).
 // escalate — true, если нужно выключить aiActive и позвать менеджера.
 export async function handleUserMessage({ db, chatId, userText, username }) {
+  const photoShortcut = await tryPhotoShortcut({ db, chatId, userText, username });
+  if (photoShortcut) return photoShortcut;
+
   const history = await loadHistory(db, chatId);
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
