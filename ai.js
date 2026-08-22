@@ -435,7 +435,14 @@ async function callModel(messages, attempt = 1) {
     return data.choices[0].message;
   } catch (err) {
     const status = err.response?.status;
-    const isTransient = !err.response || status === 429 || status >= 500;
+    // ФИКС "ретраи усугубляют дневной лимit": 429 у бесплатных моделей OpenRouter
+    // почти всегда означает суточную квоту (free-models-per-day), а не разовый
+    // всплеск нагрузки — повтор ТУТ ЖЕ гарантированно провалится снова и просто
+    // тратит ещё одну попытку из той же исчерпанной квоты (сама документация
+    // OpenRouter прямо предупреждает: проваленные запросы тоже считаются в лимит).
+    // Поэтому 429 больше НЕ ретраим — только реальные временные сбои (нет ответа
+    // вообще / 5xx — сервер модели прилёг).
+    const isTransient = !err.response || status >= 500;
     if (isTransient && attempt < 3) {
       console.warn(`⚠️  Сбой запроса к ИИ (попытка ${attempt}, status=${status ?? 'нет ответа'}), пробую ещё раз...`);
       await new Promise(resolve => setTimeout(resolve, 800 * attempt));
