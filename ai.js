@@ -136,7 +136,7 @@ export const AI_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          product_name: { type: 'string', description: 'Название товара, чьё фото нужно отправить (как оно фигурирует в каталоге/переписке)' },
+          product_name: { type: 'string', description: 'Название МОДЕЛИ товара, чьё фото нужно отправить (например "Nike Air Force 1") — размер и цвет указывать не обязательно, фото одно на модель' },
         },
         required: ['product_name'],
       },
@@ -277,6 +277,13 @@ async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
 // чтобы не плодить циклическую зависимость) — поэтому здесь так же, как и с
 // escalate_to_human, возвращаем служебный маркер с URL фото, а handleUserMessage
 // ниже вычленяет его из ответа инструмента и кладёт в photoUrl итогового результата.
+// ФИКС "фото нет, хотя товар в каталоге есть": в этом каталоге размер/цвет — это
+// ОТДЕЛЬНЫЕ карточки товара (например "Nike Air Force 1, 43, белые" и "Nike Air
+// Force 1, 44, чёрные" — разные id), а не одна карточка с вариациями. Грузить
+// фото в КАЖДУЮ такую карточку вручную неудобно и не нужно — это один и тот же
+// товар. Поэтому вместо проверки только первой найденной карточки (list[0])
+// перебираем ВСЕ карточки, подходящие под запрос, и берём фото у первой же, где
+// оно реально загружено — не важно, что это могла быть карточка другого размера.
 async function toolSendProductPhoto({ search_query, product_name, chatId, db, username }) {
   const query = product_name || search_query;
   try {
@@ -288,10 +295,13 @@ async function toolSendProductPhoto({ search_query, product_name, chatId, db, us
     const list = products?.products || products || [];
     if (!list.length) return `Товар "${query}" не найден в каталоге, фото отправить нечего.`;
 
-    const photoUrl = await getProductPhotoUrl(list[0].id);
-    if (!photoUrl) return `У товара "${list[0].name}" в каталоге нет загруженного фото.`;
-
-    return `[[SEND_PHOTO:${photoUrl}]] Фото товара "${list[0].name}" отправлено клиенту отдельным сообщением.`;
+    for (const product of list.slice(0, 15)) {
+      const photoUrl = await getProductPhotoUrl(product.id).catch(() => null);
+      if (photoUrl) {
+        return `[[SEND_PHOTO:${photoUrl}]] Фото товара "${product.name}" отправлено клиенту отдельным сообщением.`;
+      }
+    }
+    return `Ни у одной карточки товара "${query}" в каталоге нет загруженного фото.`;
   } catch (err) {
     console.error('Инструмент send_product_photo упал:', err.message);
     return 'Не удалось получить фото товара из Битрикса (техническая ошибка).';
