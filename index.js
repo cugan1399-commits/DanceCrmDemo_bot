@@ -23,7 +23,10 @@ import {
   updateDealStage,
   notifyManagerAboutEscalation,
   addDealComment,
+  getDealsWithManagerReply,
+  clearManagerReplyField,
   BITRIX_TG_FIELD_NAME,
+  BITRIX_MANAGER_REPLY_FIELD_NAME,
   ORG_TIMEZONE,
 } from './bitrix.js';
 import { handleUserMessage, isStopWordTrigger, loadHistory } from './ai.js';
@@ -529,6 +532,75 @@ cron.schedule('* * * * *', async () => {
     reminderTickRunning = false;
   }
 });
+
+// ===================== Ответ менеджера прямо из поля сделки =====================
+//
+// Менеджер открывает сделку в Битриксе, пишет текст в поле "Ответ клиенту в
+// Телеграм" и сохраняет карточку. Раз в POLL_INTERVAL секунд бот сам проверяет
+// через crm.deal.list, у каких сделок это поле не пустое, отправляет текст
+// клиенту в Telegram, гасит ИИ для этого чата (чтобы не отвечал поверх менеджера)
+// и очищает поле — чтобы то же сообщение не ушло повторно на следующем тике.
+//
+// Требует BITRIX_MANAGER_REPLY_FIELD_NAME в .env — это КОД поля (например
+// UF_CRM_1690000000000), а не подпись "Ответ клиенту в Телеграм", которую видно
+// в интерфейсе. Код можно посмотреть, открыв в браузере
+// <URL_ВХОДЯЩЕГО_ВЕБХУКА>/crm.deal.fields.json и найдя там формулу с formLabel,
+// равным подписи поля.
+const MANAGER_REPLY_POLL_SECONDS = Number(process.env.MANAGER_REPLY_POLL_SECONDS || 20);
+let managerReplyTickRunning = false; // та же защита от наложения тиков, что и у напоминаний выше
+
+async function resolveChatIdForDeal(dealId, deal) {
+  const info = db ? await db.collection('dealBookingInfo').findOne({ dealId: String(dealId) }) : null;
+  if (info?.chatId) return info.chatId;
+  const fromField = BITRIX_TG_FIELD_NAME ? Number(deal[BITRIX_TG_FIELD_NAME]) : null;
+  return fromField || null;
+}
+
+async function pollManagerReplies() {
+  if (!BITRIX_MANAGER_REPLY_FIELD_NAME) return;
+  if (managerReplyTickRunning) return;
+  managerReplyTickRunning = true;
+  try {
+    const deals = await getDealsWithManagerReply();
+    for (const deal of deals) {
+      const dealId = deal.ID;
+      const text = deal[BITRIX_MANAGER_REPLY_FIELD_NAME];
+      if (!text || !String(text).trim()) continue;
+
+      try {
+        const chatId = await resolveChatIdForDeal(dealId, deal);
+        if (!chatId) {
+          console.warn(`⚠️  Сделка #${dealId}: не удалось определить chatId клиента — поле оставляю как есть, чтобы не потерять текст`);
+          continue;
+        }
+
+        await sendMessage(chatId, text);
+        await setAiActive(chatId, false); // менеджер вступил в разговор — ИИ молчит
+
+        // Чистим поле только ПОСЛЕ успешной отправки: если это упадёт, на следующем
+        // тике мы просто попробуем снова с тем же текстом (сообщение клиенту при
+        // этом уже точно ушло один раз — риск дубля лучше риска потери текста).
+        await clearManagerReplyField(dealId).catch(err =>
+          console.error(`Не удалось очистить поле ответа у сделки #${dealId} (сообщение уже отправлено, возможен дубль на след. тике):`, err.message)
+        );
+
+        addDealComment(dealId, `👤 Менеджер ответил клиенту: ${text}`).catch(err =>
+          console.error(`Не удалось залогировать ответ менеджера в таймлайн сделки #${dealId}:`, err.message)
+        );
+
+        console.log(`✉️  Ответ менеджера по сделке #${dealId} отправлен в Telegram (chatId ${chatId})`);
+      } catch (err) {
+        console.error(`Ошибка отправки ответа менеджера по сделке #${dealId}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('Ошибка опроса поля "Ответ клиенту в Телеграм" в Битриксе:', err.message);
+  } finally {
+    managerReplyTickRunning = false;
+  }
+}
+
+cron.schedule(`*/${MANAGER_REPLY_POLL_SECONDS} * * * * *`, pollManagerReplies);
 
 // ===================== Telegram webhook: /start + кнопки напоминаний =====================
 

@@ -13,6 +13,11 @@ const BITRIX_CALENDAR_ID = process.env.BITRIX_CALENDAR_ID || '1';
 // Если ведёте общий календарь через календарь группы/отдела — поставьте 'group'.
 const BITRIX_CALENDAR_TYPE = process.env.BITRIX_CALENDAR_TYPE || 'user';
 const BITRIX_TG_FIELD_NAME = process.env.BITRIX_TG_FIELD_NAME; // напр. UF_CRM_1786993488929
+// Поле в сделке "Ответ клиенту в Телеграм" — менеджер печатает сюда текст прямо в
+// карточке сделки, а бот его подхватывает (см. pollManagerReplies в index.js) и
+// шлёт клиенту в Telegram. Код поля НЕ совпадает с тем, что написано на форме —
+// его нужно посмотреть в ответе crm.deal.fields.json (см. .env.example).
+const BITRIX_MANAGER_REPLY_FIELD_NAME = process.env.BITRIX_MANAGER_REPLY_FIELD_NAME;
 const ORG_TIMEZONE = process.env.ORG_TIMEZONE || 'Europe/Minsk';
 
 if (!BITRIX_WEBHOOK_URL) {
@@ -20,6 +25,9 @@ if (!BITRIX_WEBHOOK_URL) {
 }
 if (!BITRIX_TG_FIELD_NAME) {
   console.warn('⚠️  BITRIX_TG_FIELD_NAME не задан в .env — Telegram ID не будет сохраняться в сделке');
+}
+if (!BITRIX_MANAGER_REPLY_FIELD_NAME) {
+  console.warn('⚠️  BITRIX_MANAGER_REPLY_FIELD_NAME не задан в .env — ответы менеджера из поля сделки подхватываться не будут');
 }
 
 function methodUrl(method) {
@@ -202,4 +210,38 @@ export async function createInterestDeal({ chatId, username }) {
   return bitrixCall('crm.deal.add', { fields });
 }
 
-export { BITRIX_TG_FIELD_NAME, BITRIX_CALENDAR_ID, BITRIX_CALENDAR_TYPE, ORG_TIMEZONE };
+// ---------- Ответ менеджера прямо из поля сделки ----------
+
+// Находит сделки, где поле "Ответ клиенту в Телеграм" заполнено (менеджер только
+// что написал туда текст). Фильтр '!ПОЛЕ': '' — стандартный для Bitrix24 REST
+// способ сказать "поле НЕ равно пустой строке" (аналог != '').
+// select включает поле с Telegram ID сделки — запасной способ найти chatId,
+// если в своей БД (dealBookingInfo) записи о сделке нет (см. index.js).
+export async function getDealsWithManagerReply() {
+  if (!BITRIX_MANAGER_REPLY_FIELD_NAME) return [];
+  const select = ['ID', BITRIX_MANAGER_REPLY_FIELD_NAME];
+  if (BITRIX_TG_FIELD_NAME) select.push(BITRIX_TG_FIELD_NAME);
+  return bitrixCall('crm.deal.list', {
+    filter: { ['!' + BITRIX_MANAGER_REPLY_FIELD_NAME]: '' },
+    select,
+  });
+}
+
+// Очищаем поле сразу ПОСЛЕ успешной отправки в Telegram (см. pollManagerReplies
+// в index.js) — если очистить раньше и отправка упадёт, текст менеджера потеряется;
+// если не очищать вовсе — то же сообщение уйдёт клиенту повторно на следующем тике.
+export async function clearManagerReplyField(dealId) {
+  if (!BITRIX_MANAGER_REPLY_FIELD_NAME) return;
+  return bitrixCall('crm.deal.update', {
+    id: dealId,
+    fields: { [BITRIX_MANAGER_REPLY_FIELD_NAME]: '' },
+  });
+}
+
+export {
+  BITRIX_TG_FIELD_NAME,
+  BITRIX_MANAGER_REPLY_FIELD_NAME,
+  BITRIX_CALENDAR_ID,
+  BITRIX_CALENDAR_TYPE,
+  ORG_TIMEZONE,
+};
