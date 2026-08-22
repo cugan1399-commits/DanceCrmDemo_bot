@@ -284,53 +284,30 @@ export async function createOrderDeal({ chatId, username, contactId, productName
 }
 
 // Достаёт РЕАЛЬНОЕ фото товара из коммерческого каталога (а не то, что ИИ мог бы
-// найти в интернете и случайно перепутать модель). catalog.product.get возвращает
-// detailPicture/previewPicture как объект { id, url, urlMachine }, где url — ОТНОСИТЕЛЬНЫЙ
-// путь вида "/rest/catalog.product.download?fields[fieldName]=...&fields[fileId]=...".
-// Он не абсолютный и не содержит токен вебхука — достраиваем его сами, подставляя
-// тот же хост+токен, что уже используется во всех остальных вызовах (BITRIX_WEBHOOK_URL).
-export async function getProductPhotoUrl(productId, iblockId) {
-  const picture = await findProductOrOfferPicture(productId, iblockId);
-  if (!picture?.url) return null;
-
-  const queryIndex = picture.url.indexOf('?');
-  const query = queryIndex >= 0 ? picture.url.slice(queryIndex) : '';
-  return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
-}
-
-// ФИКС "у товара с вариациями фото не находится, хотя оно точно загружено": в
-// Битриксе, если у товара включены варианты размера/цвета, реальное фото (то, что
-// видно в разделе "Вариации" карточки товара) хранится на КОНКРЕТНОЙ вариации
-// (сущность catalog.product.offer, отдельная от самого товара) — а не на самом
-// товаре. Поэтому если у товара своей картинки нет — ищем среди его вариаций
-// (catalog.product.offer.list) и берём фото первой, у которой оно реально
-// загружено. iblockId обязателен И в select, И в filter — Bitrix отклоняет запрос
-// без него в обоих местах (проверено на реальных ответах API), поэтому его нужно
-// передать снаружи (см. вызов из ai.js — там он уже вычислен через
-// resolveCatalogIblockId для поиска по каталогу).
-async function findProductOrOfferPicture(productId, iblockId) {
-  const raw = await bitrixCall('catalog.product.get', {
-    id: productId,
-    select: ['id', 'previewPicture', 'detailPicture'],
+// найти в интернете и случайно перепутать модель). ФИКС "фото не находится, хотя
+// оно точно загружено": previewPicture/detailPicture с catalog.product.get
+// оказались пустыми, потому что фото было загружено через раздел "Вариации" в
+// карточке товара — под капотом это catalog.productImage.* с типом MORE_PHOTO,
+// который в previewPicture/detailPicture НЕ попадает (перебор через
+// catalog.product.offer.list тоже не подошёл — у этого каталога вообще нет
+// поддержки офферов, метод отвечал "productType is not allowed for this catalog").
+// catalog.productImage.list — универсальный способ получить ЛЮБОЕ фото товара
+// (previewPicture/detailPicture/MORE_PHOTO — все они там перечислены) и, что
+// особенно удобно, сразу отдаёт ГОТОВУЮ абсолютную ссылку с токеном (downloadUrl) —
+// никакой сборки URL руками, как раньше, тут не нужно.
+export async function getProductPhotoUrl(productId) {
+  const raw = await bitrixCall('catalog.productImage.list', {
+    productId,
+    select: ['id', 'name', 'productId', 'type', 'downloadUrl'],
   });
-  const product = raw?.product || raw;
-  const ownPicture = product?.detailPicture || product?.previewPicture;
-  if (ownPicture?.url) return ownPicture;
+  const images = raw?.productImages || raw || [];
+  if (!images.length) return null;
 
-  try {
-    const offersRaw = await bitrixCall('catalog.product.offer.list', {
-      filter: { parentId: productId, iblockId },
-      select: ['id', 'iblockId', 'previewPicture', 'detailPicture'],
-    });
-    const offers = offersRaw?.offers || offersRaw || [];
-    for (const offer of offers) {
-      const offerPicture = offer?.detailPicture || offer?.previewPicture;
-      if (offerPicture?.url) return offerPicture;
-    }
-  } catch (err) {
-    console.error(`Не удалось получить вариации товара #${productId} для поиска фото:`, err.message);
-  }
-  return null;
+  const preferred =
+    images.find(img => img.type === 'DETAIL_PICTURE') ||
+    images.find(img => img.type === 'PREVIEW_PICTURE') ||
+    images[0]; // любое доп. фото (MORE_PHOTO) — лучше, чем совсем без фото
+  return preferred?.downloadUrl || null;
 }
 
 // ---------- Ответ менеджера прямо из поля сделки ----------

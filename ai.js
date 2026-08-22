@@ -300,7 +300,7 @@ async function toolSendProductPhoto({ search_query, product_name, chatId, db, us
     if (!list.length) return `Товар "${query}" не найден в каталоге, фото отправить нечего.`;
 
     for (const product of list.slice(0, 15)) {
-      const photoUrl = await getProductPhotoUrl(product.id, iblockId).catch(() => null);
+      const photoUrl = await getProductPhotoUrl(product.id).catch(() => null);
       if (photoUrl) {
         return `[[SEND_PHOTO:${photoUrl}]] Фото товара "${product.name}" отправлено клиенту отдельным сообщением.`;
       }
