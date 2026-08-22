@@ -225,6 +225,31 @@ export async function createInterestDeal({ chatId, username, contactId }) {
   return bitrixCall('crm.deal.add', { fields });
 }
 
+// "Полноценная" сделка ЗАКАЗА — создаётся ИИ-консультантом ТОЛЬКО когда клиент уже
+// подтвердил конкретный товар и сообщил адрес доставки и способ оплаты (см.
+// create_order/toolCreateOrder в ai.js). В отличие от createInterestDeal, которая
+// просто фиксирует "клиент чем-то интересовался", здесь в COMMENTS сразу лежит всё,
+// что нужно менеджеру, чтобы отправить товар: что именно, цвет/размер, куда и как
+// оплата. Каждый вызов создаёт НОВУЮ сделку (а не дописывает в старую, как это
+// сделано для интереса/эскалации) — заказ это отдельная транзакция каждый раз,
+// а не одна и та же "тема" разговора, которую можно продолжать.
+export async function createOrderDeal({ chatId, username, contactId, productName, size, color, deliveryAddress, paymentMethod }) {
+  const fields = {
+    TITLE: `Заказ: ${productName}${color ? ', ' + color : ''}${size ? ', размер ' + size : ''}`,
+    COMMENTS: [
+      `Товар: ${productName}`,
+      color ? `Цвет: ${color}` : null,
+      size ? `Размер: ${size}` : null,
+      `Адрес доставки: ${deliveryAddress}`,
+      `Способ оплаты: ${paymentMethod}`,
+      username ? `Telegram: @${username}` : `Telegram chatId: ${chatId}`,
+    ].filter(Boolean).join('\n'),
+  };
+  if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
+  if (contactId) fields.CONTACT_ID = contactId;
+  return bitrixCall('crm.deal.add', { fields });
+}
+
 // ---------- Ответ менеджера прямо из поля сделки ----------
 
 // Находит сделки, где поле "Ответ клиенту в Телеграм" заполнено (менеджер только

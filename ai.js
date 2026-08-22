@@ -25,7 +25,7 @@
 //   AI_MAX_HISTORY_MESSAGES — сколько последних сообщений диалога держим в контексте (по умолчанию 16)
 
 import axios from 'axios';
-import { bitrixCall, getDeal, addDealComment, createInterestDeal, ORG_TIMEZONE } from './bitrix.js';
+import { bitrixCall, getDeal, addDealComment, createInterestDeal, createOrderDeal, ORG_TIMEZONE } from './bitrix.js';
 import { ensureContact, getActiveDealIfOpen, setActiveDeal } from './contacts.js';
 
 // Отдельный от встречи (activeBookingByChat в index.js) кеш "активной сделки" —
@@ -125,6 +125,25 @@ export const AI_TOOLS = [
       description:
         'Проверить статус текущей заявки/встречи ЭТОГО клиента (по его chatId) — используй, когда клиент спрашивает о судьбе своей записи/заказа/встречи.',
       parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_order',
+      description:
+        'Оформить реальный заказ клиента в CRM. Вызывай ЭТОТ инструмент ТОЛЬКО когда у тебя есть ВСЕ пять полей, явно подтверждённые клиентом в переписке: точное название товара (сверенное через check_product_catalog), размер, цвет, адрес доставки и способ оплаты. Если чего-то из этого не хватает — НЕ вызывай инструмент, а сначала спроси клиента текстом (по одному недостающему пункту за раз). До успешного вызова этого инструмента НИКОГДА не говори клиенту фразы вроде "заказ оформлен"/"уже оформляю"/"ваш заказ принят" — это будет неправдой, потому что реального заказа в системе ещё нет.',
+      parameters: {
+        type: 'object',
+        properties: {
+          product_name: { type: 'string', description: 'Точное название товара из каталога (как вернул check_product_catalog)' },
+          size: { type: 'string', description: 'Размер, подтверждённый клиентом' },
+          color: { type: 'string', description: 'Цвет, подтверждённый клиентом' },
+          delivery_address: { type: 'string', description: 'Адрес доставки, продиктованный клиентом' },
+          payment_method: { type: 'string', description: "Способ оплаты, выбранный клиентом (например 'наличными при получении', 'картой онлайн')" },
+        },
+        required: ['product_name', 'size', 'color', 'delivery_address', 'payment_method'],
+      },
     },
   },
   {
@@ -260,6 +279,31 @@ async function toolCheckMyDealStatus({ chatId, db }) {
   }
 }
 
+// ФИКС бага "бот говорит 'заказ оформлен', а сделки в Битриксе нет": раньше
+// оформление заказа не было отдельным действием — модель просто дописывала в
+// текстовый ответ выдуманное подтверждение (цвет/размер она тоже придумывала),
+// ничего не создавая в CRM. Теперь единственный способ для клиента "получить"
+// оформленный заказ — чтобы модель вызвала ЭТОТ инструмент, а он реально создаёт
+// сделку в Битриксе (createOrderDeal в bitrix.js). Системный промпт (ниже) прямо
+// запрещает модели произносить "заказ оформлен" до успешного вызова.
+async function toolCreateOrder({ product_name, size, color, delivery_address, payment_method, chatId, db, username }) {
+  try {
+    const contactId = await ensureContact({ db, chatId, username }).catch(err => {
+      console.error('Не удалось найти/создать карточку клиента для заказа:', err.message);
+      return null;
+    });
+    const dealId = await createOrderDeal({
+      chatId, username, contactId,
+      productName: product_name, size, color,
+      deliveryAddress: delivery_address, paymentMethod: payment_method,
+    });
+    return `Заказ успешно оформлен, сделка #${dealId} создана в CRM. Можешь подтвердить это клиенту.`;
+  } catch (err) {
+    console.error('Инструмент create_order упал:', err.message);
+    return 'Не удалось оформить заказ (техническая ошибка при обращении к Битриксу). Скажи клиенту, что оформление задержалось, и предложи позвать менеджера (escalate_to_human).';
+  }
+}
+
 // escalate_to_human обрабатывается ОТДЕЛЬНО в index.js (там же, где стоп-слова) —
 // потому что и там, и там нужно одно и то же side-effect действие (выключить
 // aiActive + уведомить менеджера), а не текстовый ответ модели. Поэтому его
@@ -271,6 +315,7 @@ async function toolEscalateToHuman({ reason }) {
 const TOOL_HANDLERS = {
   check_product_catalog: toolCheckProductCatalog,
   check_my_deal_status: toolCheckMyDealStatus,
+  create_order: toolCreateOrder,
   escalate_to_human: toolEscalateToHuman,
 };
 
@@ -319,10 +364,11 @@ async function callModel(messages) {
 
 const SYSTEM_PROMPT = `Ты — вежливый консультант компании в Telegram-чате. Отвечай кратко, по-русски, дружелюбно.
 Ты умеешь:
-— отвечать на вопросы о товарах/услугах и ценах (используй check_product_catalog);
+— отвечать на вопросы о товарах/услугах и ценах (используй check_product_catalog) — вызывай его при ЛЮБОМ упоминании товара клиентом, даже если он не спросил явно цену/наличие (например "мне нужны кроссовки" — это тоже повод вызвать check_product_catalog, а не отвечать по памяти);
 — проверять статус заявки/встречи текущего клиента (используй check_my_deal_status, chatId клиента передавать не нужно — это делается автоматически);
+— оформлять заказ (используй create_order), но ТОЛЬКО после того, как по очереди уточнишь у клиента: 1) какой именно товар (сверь через check_product_catalog), 2) размер, 3) цвет, 4) адрес доставки, 5) способ оплаты. Спрашивай недостающее по одному пункту за раз, не вываливай все вопросы сразу. Пока не собраны все пять пунктов — НЕ вызывай create_order и НЕ говори клиенту, что заказ оформлен, принят или уже готовится: это будет ложью, пока сделка реально не создана инструментом;
 — передавать диалог человеку (используй escalate_to_human), если клиент просит оператора/менеджера/человека, либо если вопрос вне твоей компетенции (жалобы, нестандартные просьбы, ты не уверен в ответе).
-Не выдумывай цены и наличие — только по данным из check_product_catalog. Если инструмент не нашёл товар — так и скажи, не придумывай.`;
+Не выдумывай цены, наличие, цвета и размеры — только по данным из check_product_catalog и из того, что явно сказал клиент. Если инструмент не нашёл товар — так и скажи, не придумывай.`;
 
 // ---------- Публичная функция: обработать сообщение пользователя ----------
 //
