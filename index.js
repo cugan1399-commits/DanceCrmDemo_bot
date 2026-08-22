@@ -226,10 +226,35 @@ async function escalateToHuman(chatId, reason, username) {
 
 // ===================== Telegram helpers =====================
 
-function sendMessage(chatId, text, keyboard) {
-  const data = { chat_id: chatId, text, parse_mode: 'HTML' };
+// ФИКС "Ошибка ИИ-консультанта: Request failed with status code 400" (роняло в
+// эскалацию по будто бы "заминке ИИ"): sendMessage шлёт текст с parse_mode 'HTML',
+// а модель форматирует ответы в markdown (**жирный**), а не в HTML. Пока в тексте
+// не было '<', '>' или '&' — Telegram просто показывал "**текст**" как есть (без
+// реального форматирования). Но стоило этим символам появиться (диапазон размеров,
+// амперсанд и т.п.) — Telegram отвечал 400 "can't parse entities", а у sendMessage
+// не было НИКАКОЙ обработки ошибок: исключение прокидывалось наверх и ловилось тем
+// же catch'ем, что и настоящие ошибки ИИ — отсюда и путаница в логах. Теперь:
+// экранируем HTML-спецсимволы (чтобы случайный '<'/'>'/'&' не ломал парсинг) и
+// конвертируем **markdown-жирный** в настоящий <b>...</b> (заодно жирный текст
+// реально станет жирным, а не звёздочками).
+function formatForTelegramHtml(text) {
+  if (!text) return text;
+  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return escaped.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+}
+
+async function sendMessage(chatId, text, keyboard) {
+  const data = { chat_id: chatId, text: formatForTelegramHtml(text), parse_mode: 'HTML' };
   if (keyboard) data.reply_markup = keyboard;
-  return axios.post(`${API}/sendMessage`, data);
+  try {
+    return await axios.post(`${API}/sendMessage`, data);
+  } catch (err) {
+    // Как и для bitrixCall/callModel — достаём реальное тело ответа Telegram
+    // (там лежит description вида "can't parse entities: ..."), а не оставляем
+    // голое "Request failed with status code 400" в логах.
+    const detail = err.response?.data?.description || err.message;
+    throw new Error(`Telegram sendMessage: ${detail}`);
+  }
 }
 
 // Отправка фото товара (см. send_product_photo в ai.js). Мы САМИ скачиваем файл с
