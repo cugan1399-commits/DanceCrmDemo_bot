@@ -269,9 +269,9 @@ export async function createInterestDeal({ chatId, username, contactId }) {
 // create_order/toolCreateOrder в ai.js). В отличие от createInterestDeal, которая
 // просто фиксирует "клиент чем-то интересовался", здесь в COMMENTS сразу лежит всё,
 // что нужно менеджеру, чтобы отправить товар: что именно, цвет/размер, куда и как
-// оплата. Каждый вызов создаёт НОВУЮ сделку (а не дописывает в старую, как это
-// сделано для интереса/эскалации) — заказ это отдельная транзакция каждый раз,
-// а не одна и та же "тема" разговора, которую можно продолжать.
+// оплата. Если у чата уже есть открытая сделка "Интерес к товару" — toolCreateOrder
+// в ai.js превращает её в заказ через convertDealToOrder (см. ниже), а эта функция
+// вызывается только когда такой сделки нет — чтобы не плодить дубли на одного клиента.
 // Человекочитаемая подпись способа оплаты в COMMENTS сделки — соответствует двум
 // вариантам, которые ИИ может передать (см. create_order в ai.js: параметр
 // payment_method — строго 'online' либо 'cash_on_delivery', а не произвольный
@@ -307,6 +307,30 @@ export async function createOrderDeal({ chatId, username, contactId, productName
   if (BITRIX_TG_FIELD_NAME) fields[BITRIX_TG_FIELD_NAME] = String(chatId);
   if (contactId) fields.CONTACT_ID = contactId;
   return bitrixCall('crm.deal.add', { fields });
+}
+
+// Превращает УЖЕ СУЩЕСТВУЮЩУЮ сделку "Интерес к товару" в заказ (те же поля, что
+// createOrderDeal строит для новой сделки, но через crm.deal.update, без создания
+// второй сделки на того же клиента). Используется, когда клиент, спросивший про
+// товар, доводит разговор до оформления — чтобы в CRM была ОДНА сделка,
+// переходящая по стадиям, а не "Интерес" + отдельный параллельный "Заказ".
+export async function convertDealToOrder(dealId, { chatId, username, productName, size, color, deliveryAddress, paymentMethod }) {
+  const paymentLabel = PAYMENT_METHOD_LABELS[paymentMethod] || paymentMethod;
+  const fields = {
+    TITLE: `Заказ: ${productName}${color ? ', ' + color : ''}${size ? ', размер ' + size : ''}`,
+    COMMENTS: [
+      `Товар: ${productName}`,
+      color ? `Цвет: ${color}` : null,
+      size ? `Размер: ${size}` : null,
+      `Адрес доставки: ${deliveryAddress}`,
+      `Способ оплаты: ${paymentLabel}${paymentMethod === 'online' ? ' (ожидает нажатия кнопки оплаты в Telegram)' : ''}`,
+      username ? `Telegram: @${username}` : `Telegram chatId: ${chatId}`,
+    ].filter(Boolean).join('\n'),
+  };
+  const stageId = STAGE_BY_PAYMENT_METHOD[paymentMethod];
+  if (stageId) fields.STAGE_ID = stageId;
+  await bitrixCall('crm.deal.update', { id: dealId, fields });
+  return dealId;
 }
 
 // Достаёт РЕАЛЬНОЕ фото товара из коммерческого каталога (а не то, что ИИ мог бы
