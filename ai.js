@@ -616,6 +616,16 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
   let escalateReason = null;
   let photoUrl = null;
   let photoFileId = null;
+  let orderCreated = false; // видит ли этот ход реальный успешный вызов create_order
+
+  // ФИКС "бот пишет 'заказ создан успешно', а create_order не вызывался вообще":
+  // слабая/бесплатная модель иногда просто сочиняет финальный текст, пропуская
+  // вызов инструмента (та же болезнь, что раньше была с фото и размерами). Раз
+  // доверять решению модели вызывать инструмент нельзя, подстраховываемся ПОСЛЕ
+  // факта: если финальный текст утверждает, что заказ создан/оформлен, а
+  // create_order в этом ходе реально не отработал успешно — не даём этой лжи
+  // уйти клиенту, а честно эскалируем к менеджеру.
+  const ORDER_SUCCESS_CLAIM_RE = /(заказ\s+(успешно\s+)?(создан|оформлен|принят)|оформил[а]?\s+(ваш\s+)?заказ)/i;
 
   // Цикл на случай нескольких последовательных вызовов инструментов подряд
   // (модель вызвала функцию -> получила результат -> решила вызвать ещё одну).
@@ -626,8 +636,16 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
     const toolCalls = assistantMsg.tool_calls;
     if (!toolCalls || toolCalls.length === 0) {
       // Обычный текстовый ответ — финал.
+      let finalText = assistantMsg.content || null;
+      if (finalText && ORDER_SUCCESS_CLAIM_RE.test(finalText) && !orderCreated) {
+        console.warn(`⚠️  Модель заявила об оформлении заказа для chatId ${chatId}, но create_order в этом ходе не вызывался/не удался — блокирую ложное сообщение, эскалирую`);
+        finalText = 'Секунду, уточню детали заказа у менеджера и вернусь с подтверждением.';
+        escalate = true;
+        escalateReason = escalateReason || 'ИИ заявил об оформлении заказа без реального вызова create_order';
+        assistantMsg.content = finalText;
+      }
       await saveHistory(db, chatId, [...history, { role: 'user', content: userText }, assistantMsg]);
-      return { replyText: assistantMsg.content || null, escalate, escalateReason, photoUrl, photoFileId };
+      return { replyText: finalText, escalate, escalateReason, photoUrl, photoFileId };
     }
 
     for (const call of toolCalls) {
@@ -640,6 +658,10 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
         resultText = `Неизвестный инструмент: ${call.function.name}`;
       } else {
         resultText = await fn({ ...args, chatId, db, username });
+      }
+
+      if (call.function.name === 'create_order' && /^Заказ успешно оформлен/.test(resultText)) {
+        orderCreated = true;
       }
 
       const escMatch = /^\[\[ESCALATED:(.*)\]\]$/.exec(resultText);
