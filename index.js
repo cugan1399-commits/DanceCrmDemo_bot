@@ -30,7 +30,7 @@ import {
   BITRIX_MANAGER_REPLY_FIELD_NAME,
   ORG_TIMEZONE,
 } from './bitrix.js';
-import { handleUserMessage, isStopWordTrigger, loadHistory } from './ai.js';
+import { handleUserMessage, isStopWordTrigger, loadHistory, slugifyProductName } from './ai.js';
 import { ensureContact, getActiveDealIfOpen, setActiveDeal } from './contacts.js';
 
 // Отдельный от встречи и от интереса к товару кеш "активной сделки" — см.
@@ -53,6 +53,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'webapp')));
+// ФИКС "Bitrix не отдаёт фото товара программно (сессионно-защищённый прокси,
+// 404 на любой серверный запрос)": вместо борьбы с чужим API храним и раздаём
+// фото товаров сами — кладём файлы в /public/product-photos в репозитории,
+// Express отдаёт их как обычную статику со своего домена. Bitrix остаётся
+// источником правды для цены/остатка/названия — фото просто живёт отдельно.
+app.use('/product-photos', express.static(path.join(__dirname, 'public/product-photos')));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -112,6 +118,12 @@ async function connectDB() {
   await db.collection('aiConversations').createIndex({ chatId: 1 }, { unique: true });
   // Кеш "chatId -> ID карточки клиента (Contact) в Битриксе" — см. contacts.js.
   await db.collection('contactByChat').createIndex({ chatId: 1 }, { unique: true });
+  // Фото товаров, присланные менеджером боту напрямую (см. обработку фото с
+  // подписью в вебхуке ниже) — храним не сам файл, а Telegram file_id: Telegram
+  // хранит файлы бессрочно и позволяет переслать по этому id без повторной
+  // загрузки. Так менеджер добавляет фото новых товаров без участия разработчика
+  // и без деплоя.
+  await db.collection('productPhotos').createIndex({ productNameSlug: 1 }, { unique: true });
   // ФИКС "дублирующиеся ответы бота": Telegram повторно шлёт тот же update, если
   // вебхук не ответил 200 достаточно быстро (например, сервер только проснулся
   // после сна на бесплатном Render-инстансе, и обработка ИИ+Bitrix заняла слишком
@@ -263,6 +275,15 @@ async function sendMessage(chatId, text, keyboard) {
 // вебхука Битрикса, светить его перед серверами Telegram не хочется, плюс так
 // надёжнее (Telegram не всегда может дотянуться до "внутренних" REST-эндпоинтов CRM).
 // Требует Node 18+ (глобальные fetch/FormData/Blob) — на Render это по умолчанию так.
+// Самый надёжный способ отправки фото товара: file_id, который менеджер уже
+// когда-то прислал боту (см. обработку фото с подписью выше). Telegram сам
+// хранит файл — просто пересылаем по id, без скачивания откуда-либо вообще.
+function sendPhotoByFileId(chatId, fileId, caption) {
+  const data = { chat_id: chatId, photo: fileId };
+  if (caption) data.caption = caption;
+  return axios.post(`${API}/sendPhoto`, data);
+}
+
 async function sendPhotoFromUrl(chatId, photoUrl, caption) {
   let imageBuffer;
   try {
@@ -852,8 +873,12 @@ async function handleAiText(chatId, text, username) {
   if (!active) return; // менеджер уже ведёт чат руками — ИИ молчит
 
   try {
-    const { replyText, escalate, escalateReason, photoUrl } = await handleUserMessage({ db, chatId, userText: text, username });
-    if (photoUrl) {
+    const { replyText, escalate, escalateReason, photoUrl, photoFileId } = await handleUserMessage({ db, chatId, userText: text, username });
+    if (photoFileId) {
+      await sendPhotoByFileId(chatId, photoFileId).catch(err => {
+        console.error('Не удалось отправить фото товара (file_id) в Telegram:', err.message);
+      });
+    } else if (photoUrl) {
       await sendPhotoFromUrl(chatId, photoUrl).catch(err => {
         console.error('Не удалось отправить фото товара в Telegram:', err.message);
       });
@@ -886,6 +911,29 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
         if (err.code === 11000) return; // уже обработали этот update — выходим молча
         console.error('Не удалось записать updateId для дедупликации (обрабатываю как обычно):', err.message);
       }
+    }
+
+    // Менеджер прислал фото товара с подписью = названием товара — сохраняем
+    // Telegram file_id (не сам файл) под этим названием. Так фото новых товаров
+    // добавляются прямо из Telegram, без участия разработчика и без деплоя —
+    // см. использование в ai.js (findProductPhotoFileId/toolSendProductPhoto).
+    if (update.message?.photo && ADMIN_TELEGRAM_IDS.includes(String(update.message.from?.id)) && db) {
+      const caption = update.message.caption?.trim();
+      const chatId = update.message.chat.id;
+      if (!caption) {
+        await sendMessage(chatId, '📷 Фото получил, но нужна подпись с названием товара (как в каталоге Битрикса) — иначе не знаю, к какому товару его привязать.');
+      } else {
+        const sizes = update.message.photo; // Telegram присылает несколько размеров одного фото
+        const fileId = sizes[sizes.length - 1].file_id; // берём самое крупное
+        const productNameSlug = slugifyProductName(caption);
+        await db.collection('productPhotos').updateOne(
+          { productNameSlug },
+          { $set: { productNameSlug, productName: caption, fileId } },
+          { upsert: true },
+        );
+        await sendMessage(chatId, `✅ Фото для «${caption}» сохранено. Теперь бот будет присылать его клиентам по запросу.`);
+      }
+      return;
     }
 
     if (update.callback_query) {
@@ -1051,6 +1099,15 @@ async function sendReply() {
 </body>
 </html>`);
 });
+
+// Render автоматически выставляет RENDER_EXTERNAL_URL для веб-сервисов — используем
+// его для построения ссылок на статику (фото товаров). PUBLIC_BASE_URL в .env —
+// на случай другого хостинга или локального теста.
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
+// Telegram user id (не chatId!) тех, кому разрешено добавлять фото товаров,
+// присылая боту фото с подписью = названием товара. Несколько через запятую.
+// Узнать свой id можно, например, у @userinfobot в Telegram.
+const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Демо-сервер (Битрикс24) запущен на порту ${PORT}`));

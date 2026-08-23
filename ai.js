@@ -25,8 +25,62 @@
 //   AI_MAX_HISTORY_MESSAGES — сколько последних сообщений диалога держим в контексте (по умолчанию 16)
 
 import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { bitrixCall, getDeal, addDealComment, createInterestDeal, createOrderDeal, getProductPhotoUrl, ORG_TIMEZONE } from './bitrix.js';
 import { ensureContact, getActiveDealIfOpen, setActiveDeal } from './contacts.js';
+
+// ФИКС "Bitrix не отдаёт фото товара программно (сессионно-защищённый прокси,
+// стабильно 404 на любой серверный запрос — проверено несколькими способами)":
+// вместо борьбы с чужим API храним и раздаём фото сами. Кладём файлы в
+// /public/product-photos в репозитории (см. app.use('/product-photos', ...) в
+// index.js), а тут просто ищем файл, чьё имя (без расширения) совпадает с
+// названием товара из каталога — это и есть основной, надёжный способ; Bitrix
+// остаётся запасным вариантом на случай, если для другого товара он всё же
+// сработает (см. toolSendProductPhoto ниже).
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PRODUCT_PHOTOS_DIR = path.join(__dirname, 'public', 'product-photos');
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
+
+export function slugifyProductName(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function findLocalProductPhotoUrl(productName) {
+  if (!productName) return null;
+  const slug = slugifyProductName(productName);
+  if (!slug) return null;
+  let files;
+  try {
+    files = fs.readdirSync(PRODUCT_PHOTOS_DIR);
+  } catch {
+    return null; // папки ещё нет или пуста — не ошибка, просто фото пока не завезли
+  }
+  const match = files.find(f => {
+    const base = slugifyProductName(f.replace(/\.[^.]+$/, ''));
+    return base && (base === slug || slug.includes(base) || base.includes(slug));
+  });
+  return match ? `${PUBLIC_BASE_URL}/product-photos/${match}` : null;
+}
+
+// Способ 0 (самый надёжный и самый предпочтительный): file_id, который менеджер
+// уже когда-то прислал боту с подписью = названием товара (см. обработку фото в
+// index.js). Telegram сам хранит файл — не нужно ничего скачивать откуда-либо.
+// Это и есть ответ на "неудобно добавлять фото каждого нового товара в код":
+// добавление происходит прямо из Telegram, без разработчика и без деплоя.
+async function findProductPhotoFileId(db, productName) {
+  if (!db || !productName) return null;
+  const slug = slugifyProductName(productName);
+  if (!slug) return null;
+  const exact = await db.collection('productPhotos').findOne({ productNameSlug: slug });
+  if (exact?.fileId) return exact.fileId;
+  // Точного совпадения нет — пробуем нестрогое (как и для локальных файлов),
+  // на случай если название в подписи от менеджера чуть отличается от каталога.
+  const all = await db.collection('productPhotos').find({}).toArray();
+  const fuzzy = all.find(doc => doc.productNameSlug && (slug.includes(doc.productNameSlug) || doc.productNameSlug.includes(slug)));
+  return fuzzy?.fileId || null;
+}
 
 // Отдельный от встречи (activeBookingByChat в index.js) кеш "активной сделки" —
 // см. подробный комментарий у getActiveDealIfOpen в contacts.js про то, почему
@@ -328,9 +382,21 @@ async function toolSendProductPhoto({ search_query, product_name, chatId, db, us
     if (!list.length) return `Товар "${query}" не найден в каталоге, фото отправить нечего.`;
 
     for (const product of list.slice(0, 15)) {
-      const photoUrl = await getProductPhotoUrl(product.id).catch(() => null);
-      if (photoUrl) {
-        return `[[SEND_PHOTO:${photoUrl}]] Фото товара "${product.name}" отправлено клиенту отдельным сообщением.`;
+      // Способ 0 (основной): file_id, присланный менеджером через Telegram.
+      const fileId = await findProductPhotoFileId(db, product.name);
+      if (fileId) {
+        return `[[SEND_PHOTO_FILEID:${fileId}]] Фото товара "${product.name}" отправлено клиенту отдельным сообщением.`;
+      }
+      // Способ 1 (запасной): своё фото, захостенное в самом репозитории.
+      const localUrl = findLocalProductPhotoUrl(product.name);
+      if (localUrl) {
+        return `[[SEND_PHOTO:${localUrl}]] Фото товара "${product.name}" отправлено клиенту отдельным сообщением.`;
+      }
+      // Способ 2 (последний резерв): попытка вытащить фото из самого Битрикса —
+      // для этого портала стабильно не срабатывает (см. комментарии в bitrix.js).
+      const bitrixUrl = await getProductPhotoUrl(product.id).catch(() => null);
+      if (bitrixUrl) {
+        return `[[SEND_PHOTO:${bitrixUrl}]] Фото товара "${product.name}" отправлено клиенту отдельным сообщением.`;
       }
     }
     return `Ни у одной карточки товара "${query}" в каталоге нет загруженного фото.`;
@@ -494,9 +560,11 @@ async function tryPhotoShortcut({ db, chatId, userText, username }) {
   if (!productName) return null; // ещё не обсуждали никакой конкретный товар — пусть разбирается модель
 
   const resultText = await toolSendProductPhoto({ product_name: productName, chatId, db, username });
-  const photoMatch = /\[\[SEND_PHOTO:(.*?)\]\]/.exec(resultText);
+  const fileIdMatch = /\[\[SEND_PHOTO_FILEID:(.*?)\]\]/.exec(resultText);
+  const photoMatch = !fileIdMatch && /\[\[SEND_PHOTO:(.*?)\]\]/.exec(resultText);
+  const photoFileId = fileIdMatch ? fileIdMatch[1] : null;
   const photoUrl = photoMatch ? photoMatch[1] : null;
-  const replyText = photoUrl ? null : resultText; // если фото ушло — лишний текст не нужен
+  const replyText = (photoFileId || photoUrl) ? null : resultText; // если фото ушло — лишний текст не нужен
 
   // Сохраняем в историю, чтобы у модели дальше был контекст, что фото уже прислали
   // (или что его не нашлось) — иначе на следующий вопрос она снова будет гадать.
@@ -504,10 +572,10 @@ async function tryPhotoShortcut({ db, chatId, userText, username }) {
   await saveHistory(db, chatId, [
     ...history,
     { role: 'user', content: userText },
-    { role: 'assistant', content: photoUrl ? `Отправил клиенту фото товара "${productName}".` : resultText },
+    { role: 'assistant', content: (photoFileId || photoUrl) ? `Отправил клиенту фото товара "${productName}".` : resultText },
   ]);
 
-  return { replyText, escalate: false, escalateReason: null, photoUrl };
+  return { replyText, escalate: false, escalateReason: null, photoUrl, photoFileId };
 }
 
 // ---------- Публичная функция: обработать сообщение пользователя ----------
@@ -529,6 +597,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
   let escalate = false;
   let escalateReason = null;
   let photoUrl = null;
+  let photoFileId = null;
 
   // Цикл на случай нескольких последовательных вызовов инструментов подряд
   // (модель вызвала функцию -> получила результат -> решила вызвать ещё одну).
@@ -540,7 +609,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
     if (!toolCalls || toolCalls.length === 0) {
       // Обычный текстовый ответ — финал.
       await saveHistory(db, chatId, [...history, { role: 'user', content: userText }, assistantMsg]);
-      return { replyText: assistantMsg.content || null, escalate, escalateReason, photoUrl };
+      return { replyText: assistantMsg.content || null, escalate, escalateReason, photoUrl, photoFileId };
     }
 
     for (const call of toolCalls) {
@@ -560,9 +629,12 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
         escalate = true;
         escalateReason = escMatch[1];
       }
-      const photoMatch = /\[\[SEND_PHOTO:(.*?)\]\]/.exec(resultText);
-      if (photoMatch) {
-        photoUrl = photoMatch[1];
+      const fileIdMatch = /\[\[SEND_PHOTO_FILEID:(.*?)\]\]/.exec(resultText);
+      if (fileIdMatch) {
+        photoFileId = fileIdMatch[1];
+      } else {
+        const photoMatch = /\[\[SEND_PHOTO:(.*?)\]\]/.exec(resultText);
+        if (photoMatch) photoUrl = photoMatch[1];
       }
 
       messages.push({ role: 'tool', tool_call_id: call.id, content: resultText });
@@ -570,7 +642,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
   }
 
   // Не уложились в лимит шагов — на всякий случай отдаём то, что накопилось, как эскалацию
-  return { replyText: 'Секунду, уточню у менеджера и вернусь с ответом.', escalate: true, escalateReason: escalateReason || 'много шагов ИИ без финального ответа', photoUrl };
+  return { replyText: 'Секунду, уточню у менеджера и вернусь с ответом.', escalate: true, escalateReason: escalateReason || 'много шагов ИИ без финального ответа', photoUrl, photoFileId };
 }
 
 // ---------- Стоп-слова (быстрый путь, без обращения к модели) ----------
