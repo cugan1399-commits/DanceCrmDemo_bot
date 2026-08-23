@@ -338,7 +338,7 @@ export async function getProductPhotoUrl(productId) {
     const iblockId = productForIblock?.iblockId;
     if (iblockId) {
       const childrenRaw = await bitrixCall('catalog.product.list', {
-        select: ['id', 'previewPicture', 'detailPicture'],
+        select: ['id', 'iblockId', 'previewPicture', 'detailPicture'],
         filter: { iblockId, parentId: productId },
       });
       const children = childrenRaw?.products || childrenRaw || [];
