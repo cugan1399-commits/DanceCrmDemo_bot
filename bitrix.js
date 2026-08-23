@@ -329,6 +329,11 @@ export async function getProductPhotoUrl(productId) {
       console.log(`📷 Способ 1 (собственное фото товара #${productId}): raw url="${picture.url}" → итоговая ссылка="${finalUrl}"`);
       return finalUrl;
     }
+    // ДИАГНОСТИКА: судя по карточке в админке, главное фото у товара ЕСТЬ, но
+    // Способ 1 сюда не долетает — печатаем сырой ответ целиком, чтобы увидеть,
+    // как named поля называются на самом деле (возможно, не previewPicture/
+    // detailPicture, а что-то другое — это НЕ задокументировано стабильно).
+    console.log(`📷 Способ 1 товара #${productId}: главной картинки в ответе нет, сырой ответ catalog.product.get:`, JSON.stringify(productRaw));
   } catch (err) {
     console.error(`catalog.product.get для товара #${productId} упал при поиске фото:`, err.message);
   }
