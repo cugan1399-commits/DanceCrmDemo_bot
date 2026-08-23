@@ -355,12 +355,31 @@ export async function getProductPhotoUrl(productId) {
     console.error(`Поиск вариации товара #${productId} через catalog.product.list упал:`, err.message);
   }
 
-  // Все три способа не нашли фото — печатаем сырые ответы Битрикса, чтобы в
-  // следующий раз сразу видеть, что реально приходит от API, а не гадать заново.
+  // Все три способа не нашли фото — как диагностику ЗАОДНО делаем широкий запрос
+  // ВСЕХ вариаций (type=2) в этом инфоблоке (без фильтра по parentId — вдруг
+  // формат поля parentId не такой простой, как мы предположили) и печатаем сырой
+  // ответ целиком. Так вместо гадания через ручной тестер Битрикса (который явно
+  // не принял наш JSON правильно) сразу увидим настоящую структуру данных через
+  // уже рабочий код.
+  let offersDump = null;
+  try {
+    const productForIblock = productRaw?.product || productRaw;
+    const iblockId = productForIblock?.iblockId;
+    if (iblockId) {
+      offersDump = await bitrixCall('catalog.product.list', {
+        select: ['id', 'iblockId', 'name', 'parentId', 'previewPicture', 'detailPicture', 'type'],
+        filter: { iblockId, type: 2 },
+      });
+    }
+  } catch (err) {
+    offersDump = { error: err.message };
+  }
+
   console.warn(
     `⚠️  Фото товара #${productId} не найдено ни одним способом. ` +
     `catalog.product.get → ${JSON.stringify(productRaw)}; ` +
-    `catalog.productImage.list → ${JSON.stringify(imagesRaw)}`
+    `catalog.productImage.list → ${JSON.stringify(imagesRaw)}; ` +
+    `ВСЕ вариации (type=2) в инфоблоке → ${JSON.stringify(offersDump)}`
   );
   return null;
 }
