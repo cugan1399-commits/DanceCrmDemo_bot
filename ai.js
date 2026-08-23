@@ -345,6 +345,22 @@ async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
       return notFoundText;
     }
     await rememberLastProduct(db, chatId, list[0].name);
+
+    // ФИКС "модель вываливает цены/размеры на общий вопрос про категорию":
+    // текстовая просьба в промпте ("на общий вопрос — только названия") слабая
+    // модель регулярно игнорирует. Раз словам не доверяем — режем данные ДО
+    // того, как они попадут к модели: если по запросу нашлось НЕСКОЛЬКО товаров
+    // (значит клиент спросил обобщённо, а не назвал конкретную модель), модель
+    // физически не получает ни цену, ни размеры, ни описание — только названия.
+    // Полную карточку модель получает только когда совпадение ровно одно
+    // (клиент уже назвал/уточнил конкретную модель).
+    if (list.length > 1) {
+      const briefLines = list.slice(0, 8).map(p => `• ${p.name}`);
+      const resultText = `Найдено несколько подходящих товаров (клиент спросил про категорию в целом, а не назвал конкретную модель). Приведи клиенту РОВНО этот список названий, без цен/размеров/остатков/описаний, и спроси, какая модель интересует:\n${briefLines.join('\n')}`;
+      await logProductInterestToDeal({ chatId, db, username, search_query, summary: resultText });
+      return resultText;
+    }
+
     const pricesByProductId = await fetchPricesByProductIds(list.map(p => p.id));
     // ФИКС "модель сама придумывает 'фото есть'/'фото нет'": раньше это никак не
     // проверялось в check_product_catalog, и модель просто гадала (запрет в
@@ -531,6 +547,22 @@ async function saveHistory(db, chatId, messages) {
   );
 }
 
+// ФИКС "бот дособирает заказ из данных прошлого заказа, не спрашивая заново":
+// текстовая инструкция в промпте ("всегда переспрашивай, даже если это уже
+// звучало раньше") слабая/бесплатная модель регулярно игнорирует — она просто
+// видит адрес/оплату в истории переписки и решает, что этого достаточно.
+// Раз на промпт полагаться нельзя, убираем возможность физически: как только
+// заказ реально оформлен (create_order отработал), стираем историю диалога для
+// этого чата. Следующий вопрос клиента начнётся с чистого листа, и модели
+// неоткуда будет "вспомнить" старый адрес/размер/оплату — придётся спросить.
+async function clearHistoryAfterOrder(db, chatId) {
+  if (!db) return;
+  await db.collection('aiConversations').updateOne(
+    { chatId },
+    { $set: { messages: [], updatedAt: new Date() } },
+  ).catch(err => console.error('Не удалось очистить историю диалога после оформления заказа:', err.message));
+}
+
 // ---------- Вызов модели ----------
 
 // ФИКС "ИИ спрыгнул на простом вопросе (зовёт менеджера из-за технической заминки)":
@@ -668,7 +700,14 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
         escalateReason = escalateReason || 'ИИ заявил об оформлении заказа без реального вызова create_order';
         assistantMsg.content = finalText;
       }
-      await saveHistory(db, chatId, [...history, { role: 'user', content: userText }, assistantMsg]);
+      if (orderCreated) {
+        // Заказ реально оформлен в этом ходе — не сохраняем накопленную переписку
+        // (адрес/размер/оплату), а стираем историю, чтобы следующий заказ этого
+        // клиента модель собирала заново, а не подглядывала в этот же диалог.
+        await clearHistoryAfterOrder(db, chatId);
+      } else {
+        await saveHistory(db, chatId, [...history, { role: 'user', content: userText }, assistantMsg]);
+      }
       return { replyText: finalText, escalate, escalateReason, photoUrl, photoFileId, payButtonDealId };
     }
 
