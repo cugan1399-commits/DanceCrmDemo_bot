@@ -284,30 +284,56 @@ export async function createOrderDeal({ chatId, username, contactId, productName
 }
 
 // Достаёт РЕАЛЬНОЕ фото товара из коммерческого каталога (а не то, что ИИ мог бы
-// найти в интернете и случайно перепутать модель). ФИКС "фото не находится, хотя
-// оно точно загружено": previewPicture/detailPicture с catalog.product.get
-// оказались пустыми, потому что фото было загружено через раздел "Вариации" в
-// карточке товара — под капотом это catalog.productImage.* с типом MORE_PHOTO,
-// который в previewPicture/detailPicture НЕ попадает (перебор через
-// catalog.product.offer.list тоже не подошёл — у этого каталога вообще нет
-// поддержки офферов, метод отвечал "productType is not allowed for this catalog").
-// catalog.productImage.list — универсальный способ получить ЛЮБОЕ фото товара
-// (previewPicture/detailPicture/MORE_PHOTO — все они там перечислены) и, что
-// особенно удобно, сразу отдаёт ГОТОВУЮ абсолютную ссылку с токеном (downloadUrl) —
-// никакой сборки URL руками, как раньше, тут не нужно.
+// найти в интернете и случайно перепутать модель). ФИКС "то один, то другой метод
+// возвращает пусто, хотя фото точно есть": пробуем ОБА задокументированных
+// способа по очереди, а не полагаемся на один — на этом портале выясняется
+// эмпирически, какой из них реально работает.
 export async function getProductPhotoUrl(productId) {
-  const raw = await bitrixCall('catalog.productImage.list', {
-    productId,
-    select: ['id', 'name', 'productId', 'type', 'downloadUrl'],
-  });
-  const images = raw?.productImages || raw || [];
-  if (!images.length) return null;
+  // Способ 1: собственное фото товара через catalog.product.get. Формат ответа —
+  // { id, url, urlMachine }, где url — ОТНОСИТЕЛЬНЫЙ путь вида
+  // "/rest/catalog.product.download?fields[...]" (нужно достроить хост+токен).
+  let productRaw = null;
+  try {
+    productRaw = await bitrixCall('catalog.product.get', {
+      id: productId,
+      select: ['id', 'previewPicture', 'detailPicture'],
+    });
+    const product = productRaw?.product || productRaw;
+    const picture = product?.detailPicture || product?.previewPicture;
+    if (picture?.url) {
+      const queryIndex = picture.url.indexOf('?');
+      const query = queryIndex >= 0 ? picture.url.slice(queryIndex) : '';
+      return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+    }
+  } catch (err) {
+    console.error(`catalog.product.get для товара #${productId} упал при поиске фото:`, err.message);
+  }
 
-  const preferred =
-    images.find(img => img.type === 'DETAIL_PICTURE') ||
-    images.find(img => img.type === 'PREVIEW_PICTURE') ||
-    images[0]; // любое доп. фото (MORE_PHOTO) — лучше, чем совсем без фото
-  return preferred?.downloadUrl || null;
+  // Способ 2: catalog.productImage.list — отдаёт готовый downloadUrl (с токеном).
+  let imagesRaw = null;
+  try {
+    imagesRaw = await bitrixCall('catalog.productImage.list', {
+      productId,
+      select: ['id', 'name', 'productId', 'type', 'downloadUrl'],
+    });
+    const images = imagesRaw?.productImages || imagesRaw || [];
+    const preferred =
+      images.find(img => img.type === 'DETAIL_PICTURE') ||
+      images.find(img => img.type === 'PREVIEW_PICTURE') ||
+      images[0];
+    if (preferred?.downloadUrl) return preferred.downloadUrl;
+  } catch (err) {
+    console.error(`catalog.productImage.list для товара #${productId} упал при поиске фото:`, err.message);
+  }
+
+  // Оба способа не нашли фото — печатаем сырые ответы Битрикса, чтобы в следующий
+  // раз сразу видеть, что реально приходит от API, а не гадать заново.
+  console.warn(
+    `⚠️  Фото товара #${productId} не найдено ни одним способом. ` +
+    `catalog.product.get → ${JSON.stringify(productRaw)}; ` +
+    `catalog.productImage.list → ${JSON.stringify(imagesRaw)}`
+  );
+  return null;
 }
 
 // ---------- Ответ менеджера прямо из поля сделки ----------
