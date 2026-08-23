@@ -264,7 +264,18 @@ async function sendMessage(chatId, text, keyboard) {
 // надёжнее (Telegram не всегда может дотянуться до "внутренних" REST-эндпоинтов CRM).
 // Требует Node 18+ (глобальные fetch/FormData/Blob) — на Render это по умолчанию так.
 async function sendPhotoFromUrl(chatId, photoUrl, caption) {
-  const { data: imageBuffer } = await axios.get(photoUrl, { responseType: 'arraybuffer' });
+  let imageBuffer;
+  try {
+    const resp = await axios.get(photoUrl, { responseType: 'arraybuffer' });
+    imageBuffer = resp.data;
+  } catch (err) {
+    // ФИКС "Request failed with status code 404" без деталей: раньше было
+    // непонятно, КАКУЮ именно ссылку не смогли скачать и что конкретно ответил
+    // Битрикс. Теперь в лог попадает сам URL и статус — по нему сразу видно,
+    // правильно ли вообще собран адрес.
+    const status = err.response?.status;
+    throw new Error(`Не удалось скачать фото по адресу ${photoUrl}: HTTP ${status ?? '(нет ответа)'} — ${err.message}`);
+  }
   const form = new FormData();
   form.append('chat_id', String(chatId));
   if (caption) form.append('caption', caption);

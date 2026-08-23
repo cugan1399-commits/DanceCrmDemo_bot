@@ -303,7 +303,9 @@ export async function getProductPhotoUrl(productId) {
     if (picture?.url) {
       const queryIndex = picture.url.indexOf('?');
       const query = queryIndex >= 0 ? picture.url.slice(queryIndex) : '';
-      return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+      const finalUrl = `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+      console.log(`📷 Способ 1 (собственное фото товара #${productId}): raw url="${picture.url}" → итоговая ссылка="${finalUrl}"`);
+      return finalUrl;
     }
   } catch (err) {
     console.error(`catalog.product.get для товара #${productId} упал при поиске фото:`, err.message);
@@ -321,7 +323,10 @@ export async function getProductPhotoUrl(productId) {
       images.find(img => img.type === 'DETAIL_PICTURE') ||
       images.find(img => img.type === 'PREVIEW_PICTURE') ||
       images[0];
-    if (preferred?.downloadUrl) return preferred.downloadUrl;
+    if (preferred?.downloadUrl) {
+      console.log(`📷 Способ 2 (productImage.list товара #${productId}): downloadUrl="${preferred.downloadUrl}"`);
+      return preferred.downloadUrl;
+    }
   } catch (err) {
     console.error(`catalog.productImage.list для товара #${productId} упал при поиске фото:`, err.message);
   }
@@ -347,7 +352,9 @@ export async function getProductPhotoUrl(productId) {
         if (childPicture?.url) {
           const queryIndex = childPicture.url.indexOf('?');
           const query = queryIndex >= 0 ? childPicture.url.slice(queryIndex) : '';
-          return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+          const finalUrl = `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+          console.log(`📷 Способ 3 (вариация товара #${productId}): raw url="${childPicture.url}" → итоговая ссылка="${finalUrl}"`);
+          return finalUrl;
         }
       }
     }
