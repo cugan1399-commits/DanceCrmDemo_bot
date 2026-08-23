@@ -311,20 +311,36 @@ export async function getProductPhotoUrl(productId) {
     console.error(`catalog.product.get для товара #${productId} упал при поиске фото:`, err.message);
   }
 
-  // Способ 2: catalog.productImage.list — отдаёт готовый downloadUrl (с токеном).
+  // Способ 2: catalog.productImage.list. ФИКС "downloadUrl оттуда 404-ится": этот
+  // downloadUrl — прокси, требующий активную браузерную сессию портала, сервер
+  // так скачать не может. Пробуем достать РЕАЛЬНЫЙ ID файла на Диске (fileId) и
+  // получить его собственную ссылку через disk.file.get — она рассчитана именно
+  // на программный доступ.
   let imagesRaw = null;
   try {
     imagesRaw = await bitrixCall('catalog.productImage.list', {
       productId,
-      select: ['id', 'name', 'productId', 'type', 'downloadUrl'],
+      select: ['id', 'name', 'productId', 'type', 'fileId', 'downloadUrl'],
     });
     const images = imagesRaw?.productImages || imagesRaw || [];
+    console.log(`📷 catalog.productImage.list товара #${productId}, сырой ответ:`, JSON.stringify(imagesRaw));
     const preferred =
       images.find(img => img.type === 'DETAIL_PICTURE') ||
       images.find(img => img.type === 'PREVIEW_PICTURE') ||
       images[0];
+
+    if (preferred?.fileId) {
+      try {
+        const diskRaw = await bitrixCall('disk.file.get', { id: preferred.fileId });
+        console.log(`📷 disk.file.get(${preferred.fileId}), сырой ответ:`, JSON.stringify(diskRaw));
+        const diskUrl = diskRaw?.DOWNLOAD_URL || diskRaw?.result?.DOWNLOAD_URL;
+        if (diskUrl) return diskUrl;
+      } catch (err) {
+        console.error(`disk.file.get(${preferred.fileId}) упал:`, err.message);
+      }
+    }
     if (preferred?.downloadUrl) {
-      console.log(`📷 Способ 2 (productImage.list товара #${productId}): downloadUrl="${preferred.downloadUrl}"`);
+      console.log(`📷 Способ 2 запасной вариант (productImage.list товара #${productId}): downloadUrl="${preferred.downloadUrl}" (может не скачаться без сессии)`);
       return preferred.downloadUrl;
     }
   } catch (err) {
