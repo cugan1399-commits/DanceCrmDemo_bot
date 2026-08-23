@@ -310,6 +310,29 @@ export async function createOrderDeal({ chatId, username, contactId, productName
 // возвращает пусто, хотя фото точно есть": пробуем ОБА задокументированных
 // способа по очереди, а не полагаемся на один — на этом портале выясняется
 // эмпирически, какой из них реально работает.
+
+// Способ 1б: картинка лежит не в стандартных полях previewPicture/detailPicture
+// (на этом портале они пустые), а в ПОЛЬЗОВАТЕЛЬСКОМ свойстве товара (propertyNNN,
+// код и номер свойства зависят от инфоблока/портала). Такое свойство приходит
+// от catalog.product.get как массив вида
+// [{ value: { id, url: "/rest/catalog.product.download?fields[...]", urlMachine }, valueId }]
+// — то есть в ТОМ ЖЕ формате, что previewPicture/detailPicture, просто под другим
+// именем ключа. Ищем по форме значения, а не по конкретному имени свойства, чтобы
+// не зависеть от того, что оно называется именно property101 на этом портале.
+function findPropertyPictureUrl(product) {
+  if (!product) return null;
+  for (const key of Object.keys(product)) {
+    if (!/^property\d+$/i.test(key)) continue;
+    const raw = product[key];
+    const items = Array.isArray(raw) ? raw : [raw];
+    for (const item of items) {
+      const url = item?.value?.url;
+      if (typeof url === 'string' && url.includes('catalog.product.download')) return url;
+    }
+  }
+  return null;
+}
+
 export async function getProductPhotoUrl(productId) {
   // Способ 1: собственное фото товара через catalog.product.get. Формат ответа —
   // { id, url, urlMachine }, где url — ОТНОСИТЕЛЬНЫЙ путь вида
@@ -322,18 +345,15 @@ export async function getProductPhotoUrl(productId) {
     });
     const product = productRaw?.product || productRaw;
     const picture = product?.detailPicture || product?.previewPicture;
-    if (picture?.url) {
-      const queryIndex = picture.url.indexOf('?');
-      const query = queryIndex >= 0 ? picture.url.slice(queryIndex) : '';
+    const rawUrl = picture?.url || findPropertyPictureUrl(product);
+    if (rawUrl) {
+      const queryIndex = rawUrl.indexOf('?');
+      const query = queryIndex >= 0 ? rawUrl.slice(queryIndex) : '';
       const finalUrl = `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
-      console.log(`📷 Способ 1 (собственное фото товара #${productId}): raw url="${picture.url}" → итоговая ссылка="${finalUrl}"`);
+      console.log(`📷 Способ 1 (фото товара #${productId}, поле ${picture?.url ? 'previewPicture/detailPicture' : 'пользовательское property*'}): raw url="${rawUrl}" → итоговая ссылка="${finalUrl}"`);
       return finalUrl;
     }
-    // ДИАГНОСТИКА: судя по карточке в админке, главное фото у товара ЕСТЬ, но
-    // Способ 1 сюда не долетает — печатаем сырой ответ целиком, чтобы увидеть,
-    // как named поля называются на самом деле (возможно, не previewPicture/
-    // detailPicture, а что-то другое — это НЕ задокументировано стабильно).
-    console.log(`📷 Способ 1 товара #${productId}: главной картинки в ответе нет, сырой ответ catalog.product.get:`, JSON.stringify(productRaw));
+    console.log(`📷 Способ 1 товара #${productId}: картинки не нашлось ни в previewPicture/detailPicture, ни в property*, сырой ответ:`, JSON.stringify(productRaw));
   } catch (err) {
     console.error(`catalog.product.get для товара #${productId} упал при поиске фото:`, err.message);
   }
