@@ -296,7 +296,7 @@ export async function getProductPhotoUrl(productId) {
   try {
     productRaw = await bitrixCall('catalog.product.get', {
       id: productId,
-      select: ['id', 'previewPicture', 'detailPicture'],
+      select: ['id', 'iblockId', 'type', 'previewPicture', 'detailPicture'],
     });
     const product = productRaw?.product || productRaw;
     const picture = product?.detailPicture || product?.previewPicture;
@@ -326,8 +326,37 @@ export async function getProductPhotoUrl(productId) {
     console.error(`catalog.productImage.list для товара #${productId} упал при поиске фото:`, err.message);
   }
 
-  // Оба способа не нашли фото — печатаем сырые ответы Битрикса, чтобы в следующий
-  // раз сразу видеть, что реально приходит от API, а не гадать заново.
+  // Способ 3: даже когда в UI выбираешь "Простой товар", Битрикс на этом портале
+  // всё равно создаёт запись с type=3 ("товар с вариациями") — реальное фото
+  // тогда лежит на ДОЧЕРНЕЙ вариации (отдельная запись с parentId=productId).
+  // Специальный catalog.product.offer.list для этого каталога заблокирован
+  // ("productType is not allowed for this catalog"), но обычный
+  // catalog.product.list работает без ограничений — используем его же для
+  // поиска дочерней записи по parentId, в обход заблокированного метода.
+  try {
+    const productForIblock = productRaw?.product || productRaw;
+    const iblockId = productForIblock?.iblockId;
+    if (iblockId) {
+      const childrenRaw = await bitrixCall('catalog.product.list', {
+        select: ['id', 'previewPicture', 'detailPicture'],
+        filter: { iblockId, parentId: productId },
+      });
+      const children = childrenRaw?.products || childrenRaw || [];
+      for (const child of children) {
+        const childPicture = child?.detailPicture || child?.previewPicture;
+        if (childPicture?.url) {
+          const queryIndex = childPicture.url.indexOf('?');
+          const query = queryIndex >= 0 ? childPicture.url.slice(queryIndex) : '';
+          return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/catalog.product.download${query}`;
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Поиск вариации товара #${productId} через catalog.product.list упал:`, err.message);
+  }
+
+  // Все три способа не нашли фото — печатаем сырые ответы Битрикса, чтобы в
+  // следующий раз сразу видеть, что реально приходит от API, а не гадать заново.
   console.warn(
     `⚠️  Фото товара #${productId} не найдено ни одним способом. ` +
     `catalog.product.get → ${JSON.stringify(productRaw)}; ` +
