@@ -6,6 +6,15 @@
 // Обязательные переменные окружения — см. .env.example
 
 import 'dotenv/config';
+import dns from 'dns';
+// ФИКС "connect ETIMEDOUT ...; connect ENETUNREACH 2001:...": на бесплатном
+// инстансе Render нет исходящего IPv6-маршрута, а Node по умолчанию сначала
+// пробует IPv6-адрес (AAAA-запись) и только потом IPv4 — из-за этого запросы к
+// Telegram API (и вообще к любым внешним хостам) периодически падали с сетевой
+// ошибкой ещё до того, как долетали до IPv4. Явно говорим Node всегда пробовать
+// IPv4 первым — это ничего не ломает на хостах С IPv6, просто убирает лишнюю
+// (и здесь нерабочую) попытку.
+dns.setDefaultResultOrder('ipv4first');
 import express from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
@@ -255,12 +264,23 @@ function formatForTelegramHtml(text) {
   return escaped.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
 }
 
-async function sendMessage(chatId, text, keyboard) {
+async function sendMessage(chatId, text, keyboard, attempt = 1) {
   const data = { chat_id: chatId, text: formatForTelegramHtml(text), parse_mode: 'HTML' };
   if (keyboard) data.reply_markup = keyboard;
   try {
     return await axios.post(`${API}/sendMessage`, data);
   } catch (err) {
+    // ФИКС "лишняя эскалация к менеджеру на ровном месте": сетевые обрывы
+    // (ETIMEDOUT/ENETUNREACH и т.п. — err.response вообще отсутствует, значит
+    // запрос не долетел до Telegram) — почти всегда кратковременные, но раньше
+    // любой такой обрыв сразу считался "технической ошибкой" и звал менеджера.
+    // Одна быстрая повторная попытка (как уже сделано для callModel) убирает
+    // большинство ложных эскалаций из-за секундной сетевой заминки.
+    if (!err.response && attempt < 2) {
+      console.warn(`⚠️  Сбой sendMessage (попытка ${attempt}, ${err.message}), пробую ещё раз...`);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      return sendMessage(chatId, text, keyboard, attempt + 1);
+    }
     // Как и для bitrixCall/callModel — достаём реальное тело ответа Telegram
     // (там лежит description вида "can't parse entities: ..."), а не оставляем
     // голое "Request failed with status code 400" в логах.
