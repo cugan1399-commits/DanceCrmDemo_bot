@@ -281,7 +281,11 @@ const PAYMENT_METHOD_LABELS = {
   cash_on_delivery: 'Оплата курьеру при получении',
 };
 const STAGE_BY_PAYMENT_METHOD = {
-  online: BITRIX_ORDER_PAID_ONLINE_STAGE_ID,
+  // 'online' сюда намеренно не входит: при оплате online сделка создаётся в
+  // дефолтной стадии воронки и переходит в BITRIX_ORDER_PAID_ONLINE_STAGE_ID
+  // только когда клиент реально нажал кнопку-заглушку оплаты в Telegram (см.
+  // handlePayOnlineCallback в index.js) — иначе получилось бы, что сделка помечена
+  // "оплачено", а клиент ещё даже не нажал кнопку.
   cash_on_delivery: BITRIX_ORDER_COD_STAGE_ID,
 };
 
@@ -294,7 +298,7 @@ export async function createOrderDeal({ chatId, username, contactId, productName
       color ? `Цвет: ${color}` : null,
       size ? `Размер: ${size}` : null,
       `Адрес доставки: ${deliveryAddress}`,
-      `Способ оплаты: ${paymentLabel}`,
+      `Способ оплаты: ${paymentLabel}${paymentMethod === 'online' ? ' (ожидает нажатия кнопки оплаты в Telegram)' : ''}`,
       username ? `Telegram: @${username}` : `Telegram chatId: ${chatId}`,
     ].filter(Boolean).join('\n'),
   };

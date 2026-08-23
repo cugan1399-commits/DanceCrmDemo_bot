@@ -89,6 +89,11 @@ const STAGE_NEW = process.env.BITRIX_NEW_STAGE_ID || 'NEW';
 const STAGE_CONFIRMED = process.env.BITRIX_CONFIRMED_STAGE_ID || 'PREPARATION';
 const STAGE_CANCELLED = process.env.BITRIX_CANCELLED_STAGE_ID || 'LOSE';
 const STAGE_VISIT_CONFIRMED = process.env.BITRIX_VISIT_CONFIRMED_STAGE_ID || STAGE_CONFIRMED;
+// Тот же UC_-код, что и BITRIX_ORDER_PAID_ONLINE_STAGE_ID в bitrix.js — сюда
+// переводим сделку заказа, когда клиент нажимает кнопку-заглушку оплаты (см.
+// handlePayOnlineCallback ниже). Дублируем константу здесь, а не импортируем,
+// потому что bitrix.js её не экспортирует (используется только внутри createOrderDeal).
+const STAGE_ORDER_PAID_ONLINE = process.env.BITRIX_ORDER_PAID_ONLINE_STAGE_ID || 'UC_W8J1FY';
 const WEBAPP_URL = process.env.WEBAPP_URL;
 
 let db;
@@ -877,6 +882,37 @@ async function handleReminderCallback(cq) {
   await sendMessage(chatId, 'Жаль! Выберите, пожалуйста, новое время в приложении:', keyboard);
 }
 
+// Кнопка-заглушка оплаты заказа (демо: реальный платёжный провайдер не подключён,
+// нажатие кнопки СЧИТАЕТСЯ успешной оплатой). Именно этот клик — единственный
+// момент, когда сделка с оплатой online переходит в STAGE_ORDER_PAID_ONLINE (при
+// создании заказа она специально остаётся в дефолтной стадии, см. bitrix.js).
+// Возвращает true/false — обработали ли мы этот callback_query, чтобы не мешать
+// handleReminderCallback (у него свой, непересекающийся формат callback_data).
+async function handlePayOnlineCallback(cq) {
+  const data = cq.data || '';
+  const match = /^pay_online_(.+)$/.exec(data);
+  if (!match) return false;
+
+  const chatId = cq.message.chat.id;
+  const messageId = cq.message.message_id;
+  const [, dealId] = match;
+
+  await answerCallback(cq.id, 'Обрабатываем оплату…');
+  await clearInlineKeyboard(chatId, messageId);
+
+  try {
+    await updateDealStage(dealId, STAGE_ORDER_PAID_ONLINE);
+    addDealComment(dealId, '💳 Клиент нажал кнопку оплаты в Telegram (демо-заглушка, реальный платёж не проводился)').catch(() => {});
+  } catch (err) {
+    console.error(`Не удалось перевести сделку #${dealId} в стадию "оплачено онлайн":`, err.message);
+    await sendMessage(chatId, 'Оплата прошла, но возникла техническая заминка при обновлении заказа — уже разбираемся.');
+    return true;
+  }
+
+  await sendMessage(chatId, '✅ Оплата прошла успешно! Ваш заказ передан в обработку.');
+  return true;
+}
+
 // Обычный текст (не команда, не нажатие инлайн-кнопки) — передаём ИИ-консультанту,
 // если он включён для этого чата. Если выключен (менеджер держит диалог руками) —
 // молча ничего не делаем, чтобы не мешать живой переписке; сам ИИ вернётся, когда
@@ -893,7 +929,7 @@ async function handleAiText(chatId, text, username) {
   if (!active) return; // менеджер уже ведёт чат руками — ИИ молчит
 
   try {
-    const { replyText, escalate, escalateReason, photoUrl, photoFileId } = await handleUserMessage({ db, chatId, userText: text, username });
+    const { replyText, escalate, escalateReason, photoUrl, photoFileId, payButtonDealId } = await handleUserMessage({ db, chatId, userText: text, username });
     if (photoFileId) {
       await sendPhotoByFileId(chatId, photoFileId).catch(err => {
         console.error('Не удалось отправить фото товара (file_id) в Telegram:', err.message);
@@ -904,6 +940,15 @@ async function handleAiText(chatId, text, username) {
       });
     }
     if (replyText) await sendMessage(chatId, replyText);
+    // Кнопка-заглушка оплаты — отдельным сообщением, чтобы её можно было прижать
+    // конкретно к этому dealId через callback_data (см. handlePayOnlineCallback).
+    if (payButtonDealId) {
+      await sendMessage(chatId, 'Осталось оплатить заказ:', {
+        inline_keyboard: [[{ text: '💳 Оплатить онлайн', callback_data: `pay_online_${payButtonDealId}` }]],
+      }).catch(err => {
+        console.error(`Не удалось отправить кнопку оплаты по сделке #${payButtonDealId}:`, err.message);
+      });
+    }
     if (escalate) await escalateToHuman(chatId, escalateReason, username);
   } catch (err) {
     console.error('Ошибка ИИ-консультанта:', err.message);
@@ -957,7 +1002,8 @@ app.post(TELEGRAM_WEBHOOK_PATH, async (req, res) => {
     }
 
     if (update.callback_query) {
-      await handleReminderCallback(update.callback_query);
+      const handledPayment = await handlePayOnlineCallback(update.callback_query);
+      if (!handledPayment) await handleReminderCallback(update.callback_query);
       return;
     }
     const text = update.message?.text;

@@ -466,7 +466,12 @@ async function toolCreateOrder({ product_name, size, color, delivery_address, pa
       productName: product_name, size, color,
       deliveryAddress: delivery_address, paymentMethod: payment_method,
     });
-    return `Заказ успешно оформлен, сделка #${dealId} создана в CRM. Можешь подтвердить это клиенту.`;
+    // Для оплаты online сделка ЕЩЁ не в стадии "оплачено" (см. комментарий у
+    // STAGE_BY_PAYMENT_METHOD в bitrix.js) — маркер ниже подхватывает index.js
+    // и присылает клиенту кнопку-заглушку оплаты; в стадию "Оплачено онлайн"
+    // сделка перейдёт только когда клиент реально её нажмёт.
+    const payButtonMarker = payment_method === 'online' ? ` [[PAY_BUTTON:${dealId}]]` : '';
+    return `Заказ успешно оформлен, сделка #${dealId} создана в CRM.${payButtonMarker} Можешь подтвердить это клиенту${payment_method === 'online' ? ' и сказать, что кнопка для оплаты придёт следующим сообщением' : ''}.`;
   } catch (err) {
     console.error('Инструмент create_order упал:', err.message);
     return 'Не удалось оформить заказ (техническая ошибка при обращении к Битриксу). Скажи клиенту, что оформление задержалось, и предложи позвать менеджера (escalate_to_human).';
@@ -616,6 +621,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
   let escalateReason = null;
   let photoUrl = null;
   let photoFileId = null;
+  let payButtonDealId = null;
   let orderCreated = false; // видит ли этот ход реальный успешный вызов create_order
 
   // ФИКС "бот пишет 'заказ создан успешно', а create_order не вызывался вообще":
@@ -645,7 +651,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
         assistantMsg.content = finalText;
       }
       await saveHistory(db, chatId, [...history, { role: 'user', content: userText }, assistantMsg]);
-      return { replyText: finalText, escalate, escalateReason, photoUrl, photoFileId };
+      return { replyText: finalText, escalate, escalateReason, photoUrl, photoFileId, payButtonDealId };
     }
 
     for (const call of toolCalls) {
@@ -662,6 +668,8 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
 
       if (call.function.name === 'create_order' && /^Заказ успешно оформлен/.test(resultText)) {
         orderCreated = true;
+        const payMatch = /\[\[PAY_BUTTON:(.*?)\]\]/.exec(resultText);
+        if (payMatch) payButtonDealId = payMatch[1];
       }
 
       const escMatch = /^\[\[ESCALATED:(.*)\]\]$/.exec(resultText);
@@ -682,7 +690,7 @@ export async function handleUserMessage({ db, chatId, userText, username }) {
   }
 
   // Не уложились в лимит шагов — на всякий случай отдаём то, что накопилось, как эскалацию
-  return { replyText: 'Секунду, уточню у менеджера и вернусь с ответом.', escalate: true, escalateReason: escalateReason || 'много шагов ИИ без финального ответа', photoUrl, photoFileId };
+  return { replyText: 'Секунду, уточню у менеджера и вернусь с ответом.', escalate: true, escalateReason: escalateReason || 'много шагов ИИ без финального ответа', photoUrl, photoFileId, payButtonDealId };
 }
 
 // ---------- Стоп-слова (быстрый путь, без обращения к модели) ----------
