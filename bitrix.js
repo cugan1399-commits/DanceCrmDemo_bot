@@ -51,6 +51,28 @@ function methodUrl(method) {
   return `${BITRIX_WEBHOOK_URL.replace(/\/$/, '')}/${method}.json`;
 }
 
+// Токен входящего вебхука — та часть URL, что идёт после /rest/{userId}/.
+// По ответу поддержки Битрикс24: именно её нужно передавать в параметре auth=
+// при скачивании файла по downloadUrl/DOWNLOAD_URL с Диска — тогда Битрикс не
+// требует авторизации через браузерную сессию (логин/пароль) и отдаёт файл
+// программно. НЕ путать с OAuth access_token — для входящего вебхука он не нужен.
+function bitrixWebhookToken() {
+  const m = /\/rest\/\d+\/([^/]+)/.exec(BITRIX_WEBHOOK_URL || '');
+  return m ? m[1] : null;
+}
+
+// Приклеивает ?auth=токен (или &auth=, если в ссылке уже есть свои параметры)
+// к ссылке на скачивание файла с Диска.
+function withAuthParam(url) {
+  const token = bitrixWebhookToken();
+  if (!token) {
+    console.warn('⚠️  Не удалось извлечь токен вебхука из BITRIX_WEBHOOK_URL — ссылка на фото уйдёт без auth= и может не скачаться');
+    return url;
+  }
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}auth=${token}`;
+}
+
 export async function bitrixCall(method, params = {}) {
   try {
     const { data } = await axios.post(methodUrl(method), params);
@@ -334,14 +356,15 @@ export async function getProductPhotoUrl(productId) {
         const diskRaw = await bitrixCall('disk.file.get', { id: preferred.fileId });
         console.log(`📷 disk.file.get(${preferred.fileId}), сырой ответ:`, JSON.stringify(diskRaw));
         const diskUrl = diskRaw?.DOWNLOAD_URL || diskRaw?.result?.DOWNLOAD_URL;
-        if (diskUrl) return diskUrl;
+        if (diskUrl) return withAuthParam(diskUrl);
       } catch (err) {
         console.error(`disk.file.get(${preferred.fileId}) упал:`, err.message);
       }
     }
     if (preferred?.downloadUrl) {
-      console.log(`📷 Способ 2 запасной вариант (productImage.list товара #${productId}): downloadUrl="${preferred.downloadUrl}" (может не скачаться без сессии)`);
-      return preferred.downloadUrl;
+      const authedUrl = withAuthParam(preferred.downloadUrl);
+      console.log(`📷 Способ 2 запасной вариант (productImage.list товара #${productId}): downloadUrl="${authedUrl}"`);
+      return authedUrl;
     }
   } catch (err) {
     console.error(`catalog.productImage.list для товара #${productId} упал при поиске фото:`, err.message);
