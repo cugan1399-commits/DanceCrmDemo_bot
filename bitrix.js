@@ -362,9 +362,13 @@ export async function getProductPhotoUrl(productId) {
       }
     }
     if (preferred?.downloadUrl) {
-      const authedUrl = withAuthParam(preferred.downloadUrl);
-      console.log(`📷 Способ 2 запасной вариант (productImage.list товара #${productId}): downloadUrl="${authedUrl}"`);
-      return authedUrl;
+      // НЕ приклеиваем auth= сюда: в отличие от disk.file.get → DOWNLOAD_URL (сырая
+      // ссылка Диска), эта ссылка уже самодостаточна — webhook-токен встроен прямо
+      // в путь (/rest/{userId}/{webhookToken}/download/), а параметр token= —
+      // подпись именно этого запроса (id/name/productId/type). Добавление auth=
+      // поверх, судя по всему, ломает эту подпись и вызывает ошибку скачивания.
+      console.log(`📷 Способ 2 запасной вариант (productImage.list товара #${productId}): downloadUrl="${preferred.downloadUrl}"`);
+      return preferred.downloadUrl;
     }
   } catch (err) {
     console.error(`catalog.productImage.list для товара #${productId} упал при поиске фото:`, err.message);
