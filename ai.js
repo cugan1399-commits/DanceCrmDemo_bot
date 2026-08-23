@@ -314,6 +314,22 @@ async function getLastProductName(db, chatId) {
   return doc?.lastProductName || null;
 }
 
+// Извлекаем строку про размеры из текста описания ("«В наличии размеры: 40, 41,
+// 43, 44, 45»") — в этом каталоге размеры НЕ структурированы как вариации/офферы,
+// это просто текст в detailText/previewText, который менеджер пишет вручную.
+// ФИКС "ИИ выдумывает размер/наличие": раньше размеры уходили в общий desc,
+// который резался до 200 символов (см. ниже) — на товарах с описанием длиннее
+// 200 символов строка про размеры (обычно в конце текста) обрезалась ЦЕЛИКОМ,
+// модель её просто не видела и начинала гадать вместо того, чтобы процитировать
+// факт. Теперь размеры достаются отдельно и попадают в результат ВСЕГДА
+// целиком, не завися от обрезки остального описания.
+function extractSizesFromText(text) {
+  if (!text) return null;
+  const m = /размер[а-я]*\s*:?\s*([\d,\s\-–]+)/i.exec(text);
+  if (!m) return null;
+  return m[1].trim().replace(/[.,;»"']+$/, '');
+}
+
 async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
   try {
     const iblockId = await resolveCatalogIblockId();
@@ -343,9 +359,11 @@ async function toolCheckProductCatalog({ search_query, chatId, db, username }) {
       const price = priceEntry ? `${priceEntry.price} ${priceEntry.currency || ''}`.trim() : 'цена не указана';
       const stock = p.quantity != null ? `, остаток: ${p.quantity} шт.` : '';
       const text = p.previewText || p.detailText;
+      const sizes = extractSizesFromText(text);
+      const sizesInfo = sizes ? `, размеры в наличии: ${sizes}` : '';
       const desc = text ? ` — ${String(text).slice(0, 200)}` : '';
       const photoStatus = photoChecks[i] ? 'фото есть' : 'фото нет';
-      return `• ${p.name}: ${price}${stock}, ${photoStatus}${desc}`;
+      return `• ${p.name}: ${price}${stock}${sizesInfo}, ${photoStatus}${desc}`;
     });
     const resultText = `Найдено в каталоге:\n${lines.join('\n')}`;
     await logProductInterestToDeal({ chatId, db, username, search_query, summary: resultText });
